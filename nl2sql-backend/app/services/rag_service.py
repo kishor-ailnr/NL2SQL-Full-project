@@ -107,6 +107,23 @@ def build_schema_index(
         logger.warning("No tables provided to build_schema_index for session '%s'", session_id)
         return
 
+    # Skip embedding generation and model loading for small schemas (<= 4 tables).
+    # Since retrieve_relevant_tables returns all tables directly for schemas <= 4,
+    # we avoid loading SentenceTransformer and PyTorch into memory during typical demo sessions.
+    if len(table_list_input) <= 4:
+        _SESSION_RAG_STORE[session_id] = {
+            "index": None,
+            "table_names": table_list_input,
+            "table_summaries": {},
+            "dimension": 0,
+        }
+        logger.info(
+            "Session '%s' has %d tables (<= 4). Skipping RAG embedding indexing to preserve memory.",
+            session_id,
+            len(table_list_input),
+        )
+        return
+
     try:
         import faiss
 

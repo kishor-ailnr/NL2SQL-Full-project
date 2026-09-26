@@ -17,11 +17,17 @@ RUN npm run build
 # ===========================================================================
 FROM python:3.11-slim AS runtime
 
-# Set runtime environment variables
+# Set runtime environment variables (strict single-threading to prevent OpenMP/MKL thread pools from exhausting Render's 512MB RAM)
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     APP_ENV=production \
-    PORT=8000
+    PORT=8000 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    VECLIB_MAXIMUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
+    TORCH_NUM_THREADS=1
 
 WORKDIR /app
 
@@ -31,11 +37,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# Install Python dependencies:
+# 1. Pre-install CPU-only PyTorch in its own layer (~150MB vs ~3.5GB CUDA)
+# 2. Install requirements with --extra-index-url so pip never replaces CPU torch with PyPI's GPU build
 COPY nl2sql-backend/requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
 
 # Copy backend application code and demo databases
 COPY nl2sql-backend/ ./nl2sql-backend/
@@ -49,9 +57,9 @@ WORKDIR /app/nl2sql-backend
 # Expose default port (Render will bind to $PORT dynamically)
 EXPOSE 8000
 
-# Health check endpoint
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+# Health check endpoint (start-period=60s to allow cold startup on throttled vCPU without triggering premature 502)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
 
-# Start Uvicorn server using shell form to expand $PORT for Render / Cloud Run
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Start Uvicorn server (single worker to fit comfortably within Render free tier 512MB RAM)
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
