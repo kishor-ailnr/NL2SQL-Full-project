@@ -20,6 +20,9 @@ export default function MessageBubble({
   unavailableMessage = null,
   needsClarification = false,
   clarificationQuestion = null,
+  needsConfirmation = false,
+  confirmationQuestion = null,
+  suggestedValue = null,
   confidence = 1.0,
   sql = null,
   queryData = null,
@@ -51,6 +54,17 @@ export default function MessageBubble({
 
   const resolvedClarificationQuestion =
     queryData?.clarification_question || clarificationQuestion || '';
+
+  const resolvedNeedsConfirmation =
+    queryData?.needs_confirmation !== undefined
+      ? Boolean(queryData.needs_confirmation)
+      : Boolean(needsConfirmation);
+
+  const resolvedConfirmationQuestion =
+    queryData?.confirmation_question || confirmationQuestion || '';
+
+  const resolvedSuggestedValue =
+    queryData?.suggested_value || suggestedValue || null;
 
   const resolvedSql = queryData?.sql ?? sql;
   const resolvedConfidence = queryData?.confidence ?? confidence;
@@ -193,6 +207,61 @@ export default function MessageBubble({
           </div>
 
           {/* Timestamp */}
+          {timestamp && (
+            <span className="text-[10px] text-slate-400 mt-1 px-1 font-sans">
+              {timestamp}
+            </span>
+          )}
+        </div>
+      </motion.div>
+    );
+  }
+
+  // -------------------------------------------------------------
+  // STATE 2b: Confirmation Question State (Did you mean...?)
+  // -------------------------------------------------------------
+  if (resolvedNeedsConfirmation) {
+    const confText =
+      resolvedConfirmationQuestion ||
+      resolvedExplanation ||
+      (resolvedSuggestedValue ? `Did you mean '${resolvedSuggestedValue}'?` : 'Please confirm your request.');
+
+    return (
+      <motion.div
+        initial={{ opacity: 0, y: 8 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.2 }}
+        className="flex w-full my-2 sm:my-2.5 justify-start"
+      >
+        <div className="w-full max-w-[96%] sm:max-w-[92%] md:max-w-[88%] flex flex-col items-start">
+          <div className="w-full bg-indigo-50/90 border border-indigo-200/90 rounded-2xl rounded-bl-xs p-3.5 sm:p-4 shadow-2xs text-indigo-950 backdrop-blur-xs">
+            <div className="flex items-center justify-between gap-2 mb-2 pb-2 border-b border-indigo-200/60">
+              <div className="flex items-center gap-2">
+                <span className="w-5 h-5 rounded-full bg-indigo-200/80 text-indigo-900 flex items-center justify-center text-xs font-bold shrink-0">
+                  ?
+                </span>
+                <span className="font-bold text-xs uppercase tracking-wider text-indigo-900">
+                  Confirmation Required
+                </span>
+              </div>
+              <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-indigo-200/60 text-indigo-800">
+                Did You Mean?
+              </span>
+            </div>
+            <p className="text-xs sm:text-sm leading-relaxed text-indigo-950 font-medium whitespace-pre-line">
+              {confText}
+            </p>
+            {resolvedSuggestedValue && (
+              <div className="mt-2.5 pt-2 border-t border-indigo-200/50 flex flex-wrap items-center gap-2 text-xs text-indigo-700">
+                <span>Suggested match:</span>
+                <span className="px-2 py-0.5 rounded-md bg-indigo-100 text-indigo-900 font-semibold font-mono text-[11px] border border-indigo-300">
+                  {resolvedSuggestedValue}
+                </span>
+                <span className="text-[11px] text-indigo-500 italic">(Reply "yes" to view)</span>
+              </div>
+            )}
+          </div>
+
           {timestamp && (
             <span className="text-[10px] text-slate-400 mt-1 px-1 font-sans">
               {timestamp}
@@ -401,6 +470,10 @@ export default function MessageBubble({
                 {resolvedExplanation}
               </p>
             )
+          ) : (queryData?.result && queryData.result.length > 0) ? (
+            <p className="text-xs sm:text-sm text-slate-700 leading-relaxed font-normal whitespace-pre-line">
+              Found {queryData.result.length} matching record{queryData.result.length === 1 ? '' : 's'}.
+            </p>
           ) : (
             <p className="text-xs sm:text-sm text-slate-500 italic">
               Query executed successfully.

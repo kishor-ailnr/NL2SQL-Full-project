@@ -44,6 +44,11 @@ class MessageDetail(BaseModel):
     data_available: Optional[bool] = True
     unavailable_message: Optional[str] = None
     corrected_terms: Optional[List[Dict[str, Any]]] = []
+    needs_confirmation: Optional[bool] = False
+    confirmation_question: Optional[str] = None
+    suggested_value: Optional[str] = None
+    needs_clarification: Optional[bool] = False
+    clarification_question: Optional[str] = None
 
 
 class ConversationMessagesResponse(BaseModel):
@@ -132,10 +137,22 @@ def get_conversation_messages(
                 parsed_result = []
 
         is_unavailable = r.query_type == "unavailable" or (r.generated_sql and r.generated_sql.startswith("-- Data unavailable"))
-        is_clarif = r.generated_sql and r.generated_sql.startswith("-- Needs clarification:")
-        sql_val = None if (is_clarif or is_unavailable) else r.generated_sql
+        is_conf = r.query_type == "confirmation" or (r.generated_sql and r.generated_sql.startswith("-- Needs confirmation"))
+        is_clarif = not is_conf and (r.query_type == "clarification" or (r.generated_sql and r.generated_sql.startswith("-- Needs clarification:")))
+        sql_val = None if (is_clarif or is_unavailable or is_conf) else r.generated_sql
         explanation_val = r.explanation
-        if is_clarif and not explanation_val:
+        sugg_val = None
+        conf_q = None
+        if is_conf and r.corrections_json:
+            try:
+                cdata = json.loads(r.corrections_json)
+                sugg_val = cdata.get("suggested_value")
+                conf_q = cdata.get("confirmation_question") or explanation_val
+            except Exception:
+                pass
+        if is_conf and not conf_q:
+            conf_q = explanation_val
+        if is_clarif and not explanation_val and r.generated_sql:
             explanation_val = r.generated_sql.replace("-- Needs clarification: ", "")
 
         messages.append(
@@ -146,10 +163,15 @@ def get_conversation_messages(
                 result=parsed_result,
                 chart_type=r.chart_type or "none",
                 timestamp=r.created_at.strftime("%Y-%m-%d %H:%M:%S") if r.created_at else "",
-                query_type=r.query_type or ("unavailable" if is_unavailable else ("clarification" if is_clarif else "select")),
+                query_type=r.query_type or ("unavailable" if is_unavailable else ("confirmation" if is_conf else ("clarification" if is_clarif else "select"))),
                 data_available=not is_unavailable,
                 unavailable_message=explanation_val if is_unavailable else None,
                 corrected_terms=[],
+                needs_confirmation=is_conf,
+                confirmation_question=conf_q,
+                suggested_value=sugg_val,
+                needs_clarification=is_clarif,
+                clarification_question=explanation_val if is_clarif else None,
             )
         )
 

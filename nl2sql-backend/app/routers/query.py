@@ -220,28 +220,34 @@ def handle_query(
         last_history = (
             db.query(QueryHistoryModel)
             .filter(QueryHistoryModel.conversation_id == conv.id)
-            .order_by(QueryHistoryModel.created_at.desc())
+            .order_by(QueryHistoryModel.created_at.desc(), QueryHistoryModel.id.desc())
             .first()
         )
         if last_history:
             prev_conf = None
-            if last_history.query_type == "confirmation" and last_history.corrections_json:
+            prev_clarif = None
+            if last_history.corrections_json:
                 try:
                     cdata = json.loads(last_history.corrections_json)
-                    if cdata.get("needs_confirmation"):
+                    if last_history.query_type == "confirmation" and cdata.get("needs_confirmation"):
                         prev_conf = {
                             "suggested_value": cdata.get("suggested_value"),
                             "literal_value": cdata.get("literal_value"),
                             "confirmation_question": last_history.explanation,
                         }
+                    if last_history.query_type == "clarification" and cdata.get("needs_clarification"):
+                        prev_clarif = cdata
                 except Exception as c_err:
-                    logger.warning("Could not parse previous confirmation data: %s", c_err)
+                    logger.warning("Could not parse previous confirmation/clarification data: %s", c_err)
 
             prev_sql = last_history.generated_sql if (last_history.generated_sql and not last_history.generated_sql.startswith("--")) else None
             conv_context = {
                 "previous_question": last_history.nl_query,
                 "previous_sql": prev_sql,
                 "previous_confirmation": prev_conf,
+                "previous_clarification": prev_clarif,
+                "previous_query_type": last_history.query_type,
+                "previous_explanation": last_history.explanation,
             }
     except Exception as ctx_err:
         logger.warning("Could not fetch conversation context: %s", ctx_err)
@@ -349,6 +355,12 @@ def handle_query(
             chart_type="none",
             confidence=confidence,
             query_type="clarification",
+            corrections_json=json.dumps({
+                "needs_clarification": True,
+                "clarification_question": clarification_q,
+                "target_name": gen_data.get("target_name"),
+                "matching_tables": gen_data.get("matching_tables"),
+            }),
             created_at=datetime.utcnow(),
         )
         db.add(query_record)
@@ -406,7 +418,7 @@ def handle_query(
         return QueryResponse(
             query_id=str(query_record.id),
             sql=None,
-            explanation=None,
+            explanation=conf_q,
             confidence=confidence,
             needs_clarification=False,
             clarification_question=None,

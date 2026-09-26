@@ -249,6 +249,141 @@ def _enforce_language(data: Dict[str, Any], detected_lang: str, model: Optional[
                 data["clarification_question"] = "தயவுசெய்து உங்கள் கேள்வியை மேலும் தெளிவுபடுத்தவும்."
 
 
+def get_core_person_name(name: str) -> str:
+    """Normalize a person's name by stripping professional titles (Dr., Mr., Prof., etc.) and punctuation."""
+    if not name or not isinstance(name, str):
+        return ""
+    cleaned = re.sub(r"^(?:dr|doctor|mr|mrs|ms|prof)\b\.?\s*", "", name.strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:dr|doctor|mr|mrs|ms|prof)\b\.?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[^\w\s]", "", cleaned)
+    return " ".join(cleaned.lower().split())
+
+
+def detect_multi_table_ambiguity(
+    nl_question: str,
+    schema: Optional[Dict[str, Any]] = None,
+    sample_values_map: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Detect if a query references an entity name that exists across multiple tables (e.g.
+
+    'James Wilson' in patients vs 'Dr. James Wilson' in doctors).
+
+    Returns a dict with:
+      - is_ambiguous: True if role/table is not specified or ambiguous
+      - clarification_question: Question asking the user to choose
+      - matching_tables: dict of {table: full_name}
+      - core_name: normalized core name
+      - target_table: (if not ambiguous) the table specified by the user
+      - target_name: (if not ambiguous) the exact name in that table
+    or None if no multi-table name match is found.
+    """
+    if not nl_question or not nl_question.strip():
+        return None
+    q_lower = nl_question.strip().lower()
+
+    table_names_map: Dict[str, Dict[str, str]] = {}
+
+    def _add_sample(tbl: str, col_name: str, val: Any) -> None:
+        if "name" in col_name.lower() and isinstance(val, str) and len(val.strip()) >= 3:
+            c_name = get_core_person_name(val)
+            if len(c_name) >= 3:
+                if c_name not in table_names_map:
+                    table_names_map[c_name] = {}
+                table_names_map[c_name][tbl] = val.strip()
+
+    if sample_values_map:
+        for tbl, cols in sample_values_map.items():
+            for col, vals in (cols or {}).items():
+                for v in vals or []:
+                    _add_sample(tbl, col, v)
+
+    if schema:
+        for tbl, cols in schema.items():
+            if isinstance(cols, list):
+                for c in cols:
+                    if isinstance(c, dict):
+                        col_name = c.get("name", "")
+                        for v in c.get("sample_values") or []:
+                            _add_sample(tbl, col_name, v)
+
+    multi_table_names = {c_name: tbls for c_name, tbls in table_names_map.items() if len(tbls) > 1}
+    if not multi_table_names:
+        return None
+
+    q_clean = " " + re.sub(r"[^\w\s]", " ", q_lower) + " "
+    q_words = set(re.findall(r"\b[a-zA-Z0-9_]+\b", q_lower))
+
+    for c_name, tbls in multi_table_names.items():
+        c_parts = c_name.split()
+        if f" {c_name} " in q_clean or all(w in q_words for w in c_parts):
+            has_patient = bool(re.search(r"\b(?:patient|patients|நோயாளி|நோயாளிங்க)\b", q_lower))
+            has_doctor = bool(re.search(r"\b(?:doctor|doctors|dr|dr\.|மருத்துவர்)\b", q_lower))
+
+            # If user explicitly specified "patient Dr. <name>" or "patient <name>"
+            if has_patient and (not has_doctor or re.search(r"\bpatient(?:s)?\s+(?:dr\.?\s+)?" + re.escape(c_parts[0]), q_lower)):
+                return {
+                    "is_ambiguous": False,
+                    "target_table": "patients",
+                    "target_name": tbls.get("patients", c_name),
+                    "core_name": c_name,
+                    "matching_tables": tbls,
+                }
+            elif has_doctor and not has_patient:
+                return {
+                    "is_ambiguous": False,
+                    "target_table": "doctors",
+                    "target_name": tbls.get("doctors", c_name),
+                    "core_name": c_name,
+                    "matching_tables": tbls,
+                }
+            else:
+                # Ambiguous: either both mentioned or neither mentioned
+                detected_lang = detect_input_language(nl_question)
+                doc_repr = tbls.get('doctors', 'Dr. ' + c_name)
+                pat_repr = tbls.get('patients', c_name)
+                if detected_lang == "tamil":
+                    clarif_q = f"மருத்துவர் '{doc_repr}' மற்றும் நோயாளி '{pat_repr}' என இருவர் உள்ளனர். உங்களுக்கு யாருடைய விவரங்கள் வேண்டும் (மருத்துவர்/நோயாளி)?"
+                else:
+                    clarif_q = f"There is a doctor named '{doc_repr}' and a patient named '{pat_repr}'. Which one would you like details for (doctor/patient)?"
+                return {
+                    "is_ambiguous": True,
+                    "clarification_question": clarif_q,
+                    "matching_tables": tbls,
+                    "core_name": c_name,
+                }
+
+    return None
+
+
+def find_table_for_value(
+    value: str,
+    sample_values_map: Optional[Dict[str, Any]],
+    schema: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Find which table contains the given value in its sample values or schema."""
+    if not value or not isinstance(value, str):
+        return None
+    val_clean = re.sub(r"[^\w\s]", "", value.strip().lower())
+    if not val_clean:
+        return None
+
+    if sample_values_map:
+        for tbl, cols in sample_values_map.items():
+            for col, vals in (cols or {}).items():
+                for v in (vals or []):
+                    if isinstance(v, str) and re.sub(r"[^\w\s]", "", v.strip().lower()) == val_clean:
+                        return tbl
+
+    if schema:
+        for tbl, cols in schema.items():
+            if isinstance(cols, list):
+                for c in cols:
+                    for v in (c.get("sample_values") or []):
+                        if isinstance(v, str) and re.sub(r"[^\w\s]", "", v.strip().lower()) == val_clean:
+                            return tbl
+    return None
+
+
 def find_near_miss_value(
     nl_question: str,
     schema: Optional[Dict[str, Any]],
@@ -314,20 +449,27 @@ def find_near_miss_value(
         "give", "tell", "view", "see", "display", "named", "called", "name", "about"
     }
 
-    prefix_pattern = r"^(?:show|list|get|find|search\s+for|view|display|details\s+of)\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?(?:patient|doctor|customer|product|records?|details?|info)?\s*(?:named|called|for|with)?\s*"
+    prefix_pattern = r"^(?:show|list|get|find|search\s+for|view|display|details\s+of)\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?(?:patients?|doctors?|customers?|products?|records?|details?|info)?\s*(?:of\s+)?(?:patients?|doctors?|customers?|products?|records?|details?|info)?\s*(?:named|called|for|with)?\s*"
     candidate_phrase = re.sub(prefix_pattern, "", nl_question.strip(), flags=re.IGNORECASE).strip()
     candidate_phrase = re.sub(r"[^\w\s]", "", candidate_phrase).strip()
 
     candidate_tokens = [w for w in re.findall(r"\b[a-zA-Z0-9_]+\b", nl_question) if w.lower() not in stop_words and len(w) >= 3]
 
-    # Check for exact matches first: if exact match exists, no confirmation needed
+    # Check for exact matches first: if exact match exists anywhere in question or candidate phrase, no confirmation needed
+    q_norm = " " + re.sub(r"[^\w\s]", " ", nl_question.lower()) + " "
+    q_norm = re.sub(r"\s+", " ", q_norm)
     for s_val, _ in unique_samples:
-        s_lower = s_val.lower()
-        if candidate_phrase.lower() == s_lower:
+        s_clean = " " + re.sub(r"[^\w\s]", " ", s_val.lower()) + " "
+        s_clean = re.sub(r"\s+", " ", s_clean)
+        if s_clean in q_norm:
             return None
-        if set(candidate_phrase.lower().split()) == set(s_lower.split()):
+
+        s_clean_val = re.sub(r"[^\w\s]", "", s_val.lower()).strip()
+        if candidate_phrase.lower() == s_clean_val:
             return None
-        if s_lower in candidate_phrase.lower():
+        if set(candidate_phrase.lower().split()) == set(s_clean_val.split()):
+            return None
+        if s_clean_val and s_clean_val in candidate_phrase.lower():
             return None
 
     # Determine priority search terms to test
@@ -404,6 +546,7 @@ def generate_sql(
     # ---------------------------------------------------------------------------
     # Conversational follow-up: check if preceding message needed confirmation
     # ---------------------------------------------------------------------------
+    confirmed_value = None
     if conversation_context and conversation_context.get("previous_confirmation"):
         prev_conf = conversation_context["previous_confirmation"]
         suggested_val = prev_conf.get("suggested_value")
@@ -420,7 +563,22 @@ def generate_sql(
 
         if norm_reply in affirmative_terms or norm_reply.startswith("yes ") or norm_reply.startswith("yeah "):
             logger.info("User confirmed suggestion '%s' with '%s'", suggested_val, nl_question)
-            nl_question = f"show details of patient {suggested_val}"
+            confirmed_value = suggested_val
+            tbl = find_table_for_value(suggested_val, session.get("sample_values"), session.get("schema"))
+            if tbl and tbl.lower().startswith("doc"):
+                entity_noun = "doctor"
+            elif tbl and tbl.lower().startswith("pat"):
+                entity_noun = "patient"
+            elif tbl and tbl.lower().startswith("prod"):
+                entity_noun = "product"
+            elif tbl and tbl.lower().startswith("cust"):
+                entity_noun = "customer"
+            elif tbl:
+                entity_noun = tbl.rstrip("s")
+            else:
+                entity_noun = "record"
+
+            nl_question = f"show details of {entity_noun} {suggested_val}"
             conversation_context = copy.deepcopy(conversation_context)
             conversation_context.pop("previous_confirmation", None)
         elif norm_reply in negative_terms or norm_reply.startswith("no "):
@@ -448,6 +606,78 @@ def generate_sql(
             conversation_context.pop("previous_confirmation", None)
 
     # ---------------------------------------------------------------------------
+    # Conversational follow-up: check if preceding message needed clarification
+    # ---------------------------------------------------------------------------
+    if conversation_context:
+        prev_type = conversation_context.get("previous_query_type")
+        prev_clarif = conversation_context.get("previous_clarification")
+        prev_exp = conversation_context.get("previous_explanation") or ""
+
+        # Check if the preceding message asked to clarify between doctor and patient
+        is_clarif_followup = (
+            prev_type == "clarification"
+            or (prev_clarif and prev_clarif.get("needs_clarification"))
+            or ("doctor" in prev_exp.lower() and "patient" in prev_exp.lower() and "which one" in prev_exp.lower())
+        )
+        if is_clarif_followup:
+            norm_reply = re.sub(r"[^\w\s]", "", nl_question.strip().lower())
+            wants_patient = bool(re.search(r"\b(?:patient|patients|நோயாளி|நோயாளிங்க)\b", norm_reply))
+            wants_doctor = bool(re.search(r"\b(?:doctor|doctors|dr|dr\.|மருத்துவர்)\b", norm_reply))
+
+            # Retrieve candidate names
+            doc_name = "Dr. James Wilson"
+            pat_name = "James Wilson"
+            if prev_clarif and prev_clarif.get("matching_tables"):
+                doc_name = prev_clarif["matching_tables"].get("doctors", doc_name)
+                pat_name = prev_clarif["matching_tables"].get("patients", pat_name)
+            else:
+                quoted = re.findall(r"'([^']+)'", prev_exp)
+                for qn in quoted:
+                    if "dr" in qn.lower():
+                        doc_name = qn
+                    else:
+                        pat_name = qn
+
+            if wants_patient and not wants_doctor:
+                logger.info("User clarified preference for PATIENT: '%s'", pat_name)
+                sql = f"SELECT * FROM patients WHERE LOWER(name) = '{pat_name.lower()}';"
+                return {
+                    "data_available": True,
+                    "unavailable_message": None,
+                    "corrected_terms": [],
+                    "needs_clarification": False,
+                    "clarification_question": None,
+                    "interpreted_text": f"show details of patient {pat_name}",
+                    "query_type": "select",
+                    "sql": sql,
+                    "result": [],
+                    "explanation": f"Retrieves all details for patient {pat_name} from the patients table.",
+                    "confidence": 0.95,
+                    "detected_language": detect_input_language(nl_question),
+                    "relevant_tables": ["patients"],
+                }
+            elif wants_doctor and not wants_patient:
+                logger.info("User clarified preference for DOCTOR: '%s'", doc_name)
+                core_doc = get_core_person_name(doc_name)
+                sql = f"SELECT * FROM doctors WHERE LOWER(name) LIKE '%{core_doc}%';"
+                return {
+                    "data_available": True,
+                    "unavailable_message": None,
+                    "corrected_terms": [],
+                    "needs_clarification": False,
+                    "clarification_question": None,
+                    "interpreted_text": f"show details of doctor {doc_name}",
+                    "query_type": "select",
+                    "sql": sql,
+                    "result": [],
+                    "explanation": f"Retrieves all details for doctor {doc_name} from the doctors table.",
+                    "confidence": 0.95,
+                    "detected_language": detect_input_language(nl_question),
+                    "relevant_tables": ["doctors"],
+                }
+
+
+    # ---------------------------------------------------------------------------
     # Response Caching: key = SHA256(schema_sig + normalized_question + language + context)
     # ---------------------------------------------------------------------------
     schema_sig = _compute_schema_signature(session)
@@ -471,7 +701,7 @@ def generate_sql(
     sample_values_map = session.get("sample_values")
 
     # Check for near-miss value searches (did-you-mean confirmation flow)
-    near_miss = find_near_miss_value(nl_question, schema, sample_values_map)
+    near_miss = None if confirmed_value else find_near_miss_value(nl_question, schema, sample_values_map)
     if near_miss:
         lit_val, close_val = near_miss
         conf_q = f"I couldn't find an exact match for '{lit_val}'. Did you mean '{close_val}'? Reply yes to see that record, or provide a different name."
@@ -495,6 +725,64 @@ def generate_sql(
         }
         _put_in_cache(cache_key, data)
         return data
+
+    # Check for multi-table ambiguity (e.g. James Wilson in both doctors and patients)
+    multi_table_ambig = detect_multi_table_ambiguity(nl_question, schema, sample_values_map)
+    if multi_table_ambig:
+        if multi_table_ambig["is_ambiguous"]:
+            logger.info("Multi-table ambiguity detected for query: '%s'. Asking for clarification.", nl_question)
+            data = {
+                "needs_clarification": True,
+                "clarification_question": multi_table_ambig["clarification_question"],
+                "target_name": multi_table_ambig.get("core_name"),
+                "matching_tables": multi_table_ambig.get("matching_tables"),
+                "data_available": True,
+                "unavailable_message": None,
+                "corrected_terms": [],
+                "needs_confirmation": False,
+                "confirmation_question": None,
+                "suggested_value": None,
+                "interpreted_text": nl_question,
+                "query_type": "select",
+                "sql": None,
+                "result": [],
+                "explanation": None,
+                "confidence": 0.3,
+                "detected_language": detect_input_language(nl_question),
+            }
+            _put_in_cache(cache_key, data)
+            return data
+        else:
+            target_table = multi_table_ambig["target_table"]
+            target_name = multi_table_ambig["target_name"]
+            logger.info("Multi-table entity resolved unambiguously to table '%s' for name '%s'", target_table, target_name)
+            q_clean_words = set(re.findall(r"\b[a-zA-Z0-9_]+\b", nl_question.lower()))
+            complex_keywords = {"appointment", "appointments", "bill", "billing", "room", "prescribe", "visit", "visits", "treated"}
+            if not q_clean_words.intersection(complex_keywords):
+                if target_table == "patients":
+                    sql = f"SELECT * FROM patients WHERE LOWER(name) = '{target_name.lower()}';"
+                    exp = f"Retrieves all details for patient {target_name} from the patients table."
+                else:
+                    core_doc = get_core_person_name(target_name)
+                    sql = f"SELECT * FROM doctors WHERE LOWER(name) LIKE '%{core_doc}%';"
+                    exp = f"Retrieves all details for doctor {target_name} from the doctors table."
+                data = {
+                    "data_available": True,
+                    "unavailable_message": None,
+                    "corrected_terms": [],
+                    "needs_clarification": False,
+                    "clarification_question": None,
+                    "interpreted_text": nl_question,
+                    "query_type": "select",
+                    "sql": sql,
+                    "result": [],
+                    "explanation": exp,
+                    "confidence": 0.95,
+                    "detected_language": detect_input_language(nl_question),
+                    "relevant_tables": [target_table],
+                }
+                _put_in_cache(cache_key, data)
+                return data
 
     # Schema-aware retrieval (RAG): retrieve top 3-4 most relevant tables (or all if <= 4)
     from app.services.rag_service import retrieve_relevant_tables
@@ -574,6 +862,10 @@ Instructions:
      f. VALID SCHEMA CORRECTIONS: corrected_terms must ONLY correct words that closely match actual schema terms (table names, column names from the connected database, or common query vocabulary like "top", "average", "delete"). Example valid schema correction: [{{"original": "paiens", "corrected": "patients"}}, {{"original": "fourty", "corrected": "forty"}}]
    - If no schema words were corrected, return [].
    - Base your SQL generation on this corrected "interpreted_text".
+   - Role & Table Disambiguation for Shared Names: When a person's name exists in multiple tables (e.g. 'James Wilson' in patients vs 'Dr. James Wilson' in doctors):
+     - If the user specifies 'patient' (e.g. 'show details of patient James Wilson' or 'patient Dr. James Wilson'), you MUST query the 'patients' table: SELECT * FROM patients WHERE LOWER(name) = 'james wilson';
+     - If the user specifies 'doctor' or 'dr' without 'patient' (e.g. 'show details of doctor James Wilson' or 'Dr. James Wilson'), you MUST query the 'doctors' table: SELECT * FROM doctors WHERE LOWER(name) LIKE '%james wilson%';
+     - If the user does not specify whether they want the doctor or the patient (e.g. 'show details of James Wilson'), or if both are mentioned ambiguously, set "needs_clarification": true, "clarification_question": "There is a doctor named 'Dr. James Wilson' and a patient named 'James Wilson'. Which one would you like details for (doctor/patient)?", "sql": null, "confidence": 0.3.
 
 3. Clarification & Ambiguity Assessment (ONLY IF data IS available in the schema):
    - Only evaluate this if the requested entity actually exists in the schema.

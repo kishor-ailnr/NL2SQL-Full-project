@@ -17,6 +17,7 @@ import {
   deleteConversation,
   getDatabaseSchema,
 } from '../api/client';
+import { formatAssistantMessage } from '../utils/messageFormatter';
 import { AiLoadingState } from './lightswind/ai-loading-state';
 
 const INITIAL_WELCOME = {
@@ -232,32 +233,10 @@ export default function ChatWindow({ session, onDisconnect }) {
           timestamp: m.timestamp,
         });
 
-        // Assistant query response message
-        const isUnavailable = m.data_available === false || m.query_type === 'unavailable';
-        const isClarif = !isUnavailable && ((!m.sql && m.explanation) || m.query_type === 'clarification');
-        formatted.push({
-          id: `asst-${convId}-${idx}`,
-          role: 'assistant',
-          userQuestion: m.nl_query,
-          queryData: {
-            query_id: `msg-${convId}-${idx}`,
-            user_question: m.nl_query,
-            query_type: m.query_type || 'select',
-            status: m.query_type === 'write' ? 'executed' : undefined,
-            isPendingWrite: false,
-            sql: m.sql,
-            explanation: m.explanation,
-            result: m.result || [],
-            chart_type: m.chart_type || 'none',
-            confidence: isClarif ? 0.3 : 1.0,
-            needs_clarification: isClarif,
-            clarification_question: isClarif ? m.explanation : null,
-            data_available: !isUnavailable,
-            unavailable_message: isUnavailable ? (m.unavailable_message || m.explanation) : null,
-            corrected_terms: m.corrected_terms || [],
-          },
-          timestamp: m.timestamp,
-        });
+        // Assistant query response message formatted with shared function
+        formatted.push(
+          formatAssistantMessage(m, m.nl_query, `asst-${convId}-${idx}`, m.timestamp)
+        );
       });
 
       setMessages(formatted);
@@ -360,18 +339,16 @@ export default function ChatWindow({ session, onDisconnect }) {
       }
 
       const isWrite = queryResponse.query_type === 'write';
-      const assistantMessage = {
-        id: `asst-${Date.now()}`,
-        role: 'assistant',
-        userQuestion: text,
-        queryData: {
+      const assistantMessage = formatAssistantMessage(
+        {
           ...queryResponse,
-          user_question: text,
           isPendingWrite: isWrite,
           status: isWrite ? 'pending' : undefined,
         },
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      };
+        text,
+        `asst-${Date.now()}`,
+        timeStr
+      );
 
       setMessages((prev) => {
         if (queryResponse?.query_id && prev.some((m) => m.queryData?.query_id === queryResponse.query_id)) {
@@ -836,8 +813,8 @@ export default function ChatWindow({ session, onDisconnect }) {
             }
 
             if (msg.queryData) {
-              const isWrite = msg.queryData.query_type === 'write';
               const isUnavailable = msg.queryData.data_available === false;
+              const isConfirmation = msg.queryData.needs_confirmation;
               const isClarif = msg.queryData.needs_clarification;
 
               return (
@@ -848,6 +825,9 @@ export default function ChatWindow({ session, onDisconnect }) {
                   content={msg.queryData.explanation || msg.queryData.unavailable_message}
                   dataAvailable={msg.queryData.data_available}
                   unavailableMessage={msg.queryData.unavailable_message}
+                  needsConfirmation={isConfirmation}
+                  confirmationQuestion={msg.queryData.confirmation_question}
+                  suggestedValue={msg.queryData.suggested_value}
                   needsClarification={isClarif}
                   clarificationQuestion={msg.queryData.clarification_question}
                   confidence={msg.queryData.confidence}
@@ -859,8 +839,8 @@ export default function ChatWindow({ session, onDisconnect }) {
                   onCancelWrite={handleCancelWrite}
                   timestamp={msg.timestamp}
                 >
-                  {/* Table / Chart Result Display: when data is available, not clarification, and results exist */}
-                  {!isClarif && !isUnavailable && msg.queryData.result && msg.queryData.result.length > 0 && (
+                  {/* Table / Chart Result Display: when data is available, not clarification, not confirmation, and results exist */}
+                  {!isClarif && !isConfirmation && !isUnavailable && msg.queryData.result && msg.queryData.result.length > 0 && (
                     <ChartPanel
                       result={msg.queryData.result}
                       chart_type={msg.queryData.chart_type || 'table'}
