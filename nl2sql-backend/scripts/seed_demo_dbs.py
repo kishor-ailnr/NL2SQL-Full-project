@@ -62,18 +62,21 @@ def seed_hospital_db():
         """
     )
 
-    # 10 Patients
+    # 13 Patients
     patients = [
         (1, "Alice Jenkins", 45, "Female", "Hypertension", "2024-01-15"),
-        (2, "Robert Martinez", 62, "Male", "Type 2 Diabetes", "2024-01-18"),
-        (3, "Clara Oswald", 29, "Female", "Asthma", "2024-02-01"),
-        (4, "David Kim", 53, "Male", "Coronary Artery Disease", "2024-02-10"),
-        (5, "Elena Rostova", 34, "Female", "Migraine", "2024-02-14"),
-        (6, "Frank Gallagher", 71, "Male", "Pneumonia", "2024-02-20"),
-        (7, "Grace Hopper", 85, "Female", "Arrhythmia", "2024-03-01"),
-        (8, "Henry Cavill", 40, "Male", "Lumbar Disc Herniation", "2024-03-05"),
-        (9, "Irene Adler", 38, "Female", "Hyperthyroidism", "2024-03-12"),
-        (10, "James Wilson", 50, "Male", "Chronic Kidney Disease", "2024-03-15"),
+        (2, "Karthik Raj", 32, "Male", "Fever", "2024-01-17"),
+        (3, "Harini Krishnan", 27, "Female", "Allergy", "2024-01-19"),
+        (4, "Robert Martinez", 62, "Male", "Type 2 Diabetes", "2024-01-18"),
+        (5, "Clara Oswald", 29, "Female", "Asthma", "2024-02-01"),
+        (6, "David Kim", 53, "Male", "Coronary Artery Disease", "2024-02-10"),
+        (7, "Elena Rostova", 34, "Female", "Migraine", "2024-02-14"),
+        (8, "Frank Gallagher", 71, "Male", "Pneumonia", "2024-02-20"),
+        (9, "Grace Hopper", 85, "Female", "Arrhythmia", "2024-03-01"),
+        (10, "Henry Cavill", 40, "Male", "Lumbar Disc Herniation", "2024-03-05"),
+        (11, "Irene Adler", 38, "Female", "Hyperthyroidism", "2024-03-12"),
+        (12, "James Wilson", 50, "Male", "Chronic Kidney Disease", "2024-03-15"),
+        (13, "Pavai", 28, "Female", "Checkup", "2024-03-20"),
     ]
     cursor.executemany(
         "INSERT INTO patients (id, name, age, gender, diagnosis, admission_date) VALUES (?, ?, ?, ?, ?, ?);",

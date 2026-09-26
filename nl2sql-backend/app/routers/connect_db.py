@@ -80,8 +80,8 @@ def sanitize_table_name(filename: str) -> str:
     return cleaned
 
 
-def fetch_column_samples(sqlite_conn: sqlite3.Connection, table_name: str, col_name: str, limit: int = 5) -> List[Any]:
-    """Fetch 3-5 distinct non-null, non-empty sample values for a column from a SQLite table."""
+def fetch_column_samples(sqlite_conn: sqlite3.Connection, table_name: str, col_name: str, limit: int = 10) -> List[Any]:
+    """Fetch distinct non-null, non-empty sample values for a column from a SQLite table."""
     try:
         safe_col = col_name.replace('"', '""')
         safe_table = table_name.replace('"', '""')
@@ -101,7 +101,7 @@ def fetch_column_samples(sqlite_conn: sqlite3.Connection, table_name: str, col_n
 
 def inspect_db_schema_and_samples(
     db_path: Path,
-    sample_limit: int = 5,
+    sample_limit: int = 10,
 ) -> tuple[List[str], Dict[str, List[Dict[str, Any]]], Dict[str, Dict[str, List[Any]]]]:
     """Inspect tables, column definitions, and sample values from a SQLite database file."""
     engine = create_engine(

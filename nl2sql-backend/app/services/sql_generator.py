@@ -249,6 +249,131 @@ def _enforce_language(data: Dict[str, Any], detected_lang: str, model: Optional[
                 data["clarification_question"] = "தயவுசெய்து உங்கள் கேள்வியை மேலும் தெளிவுபடுத்தவும்."
 
 
+def find_near_miss_value(
+    nl_question: str,
+    schema: Optional[Dict[str, Any]],
+    sample_values_map: Optional[Dict[str, Any]],
+) -> Optional[tuple[str, str]]:
+    """Detect if the user is searching for a value/name that has a genuine near-miss in sample values.
+
+    Returns (literal_user_input, suggested_close_match) if a near-miss is found,
+    or None if exact match exists or no close match exists.
+    """
+    if not nl_question or not nl_question.strip():
+        return None
+
+    q_lower = nl_question.strip().lower()
+
+    # Do not check near-miss for obvious criteria / aggregations / temporal filters
+    criteria_keywords = {
+        "day", "days", "month", "months", "year", "years", "week", "weeks",
+        "older", "younger", "greater", "less", "more", "between", "visited",
+        "admitted", "how many", "count", "average", "avg", "sum", "total",
+        "highest", "lowest", "most", "least", "top"
+    }
+    q_words_set = set(re.findall(r"\b[a-zA-Z0-9_]+\b", q_lower))
+    if q_words_set.intersection(criteria_keywords):
+        return None
+
+    # Collect distinct sample values from sample_values_map and schema
+    all_samples = []
+    if sample_values_map:
+        for tbl, cols in sample_values_map.items():
+            for col, vals in cols.items():
+                is_name = "name" in col.lower()
+                for v in vals or []:
+                    if isinstance(v, str) and len(v.strip()) >= 3:
+                        all_samples.append((v.strip(), is_name))
+    if schema:
+        for tbl, cols in schema.items():
+            if isinstance(cols, list):
+                for c in cols:
+                    if isinstance(c, dict):
+                        is_name = "name" in c.get("name", "").lower()
+                        for v in c.get("sample_values") or []:
+                            if isinstance(v, str) and len(v.strip()) >= 3:
+                                all_samples.append((v.strip(), is_name))
+
+    if not all_samples:
+        return None
+
+    seen = set()
+    unique_samples = []
+    for s_val, is_name in all_samples:
+        if s_val.lower() not in seen:
+            seen.add(s_val.lower())
+            unique_samples.append((s_val, is_name))
+
+    # Clean question to isolate candidate search phrase
+    stop_words = {
+        "show", "me", "list", "get", "find", "all", "the", "of", "for", "with", "in",
+        "by", "on", "at", "to", "a", "an", "is", "are", "was", "were", "who", "whose",
+        "details", "record", "records", "search", "query", "check", "info", "information",
+        "patient", "patients", "doctor", "doctors", "customer", "customers", "order", "orders",
+        "product", "products", "appointment", "appointments", "please", "can", "you",
+        "give", "tell", "view", "see", "display", "named", "called", "name", "about"
+    }
+
+    prefix_pattern = r"^(?:show|list|get|find|search\s+for|view|display|details\s+of)\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?(?:patient|doctor|customer|product|records?|details?|info)?\s*(?:named|called|for|with)?\s*"
+    candidate_phrase = re.sub(prefix_pattern, "", nl_question.strip(), flags=re.IGNORECASE).strip()
+    candidate_phrase = re.sub(r"[^\w\s]", "", candidate_phrase).strip()
+
+    candidate_tokens = [w for w in re.findall(r"\b[a-zA-Z0-9_]+\b", nl_question) if w.lower() not in stop_words and len(w) >= 3]
+
+    # Check for exact matches first: if exact match exists, no confirmation needed
+    for s_val, _ in unique_samples:
+        s_lower = s_val.lower()
+        if candidate_phrase.lower() == s_lower:
+            return None
+        if set(candidate_phrase.lower().split()) == set(s_lower.split()):
+            return None
+        if s_lower in candidate_phrase.lower():
+            return None
+
+    # Determine priority search terms to test
+    search_terms = []
+    if candidate_phrase and len(candidate_phrase) >= 3 and candidate_phrase.lower() not in stop_words:
+        search_terms.append(candidate_phrase)
+    for t in candidate_tokens:
+        if t not in search_terms:
+            search_terms.append(t)
+
+    for term in search_terms:
+        term_lower = term.lower()
+        best_match = None
+        best_score = 0.0
+
+        for s_val, is_name in unique_samples:
+            s_lower = s_val.lower()
+            s_words = [w.lower() for w in s_val.split()]
+
+            # 1. Exact single-word match in a multi-word sample (e.g. 'harini' matches 'Harini' in 'Harini Krishnan')
+            if term_lower in s_words and len(s_words) > 1:
+                return (term, s_val)
+
+            # 2. Substring match for names (e.g. 'harini' in 'Harini Krishnan')
+            if len(term_lower) >= 4 and term_lower in s_lower:
+                return (term, s_val)
+
+            # 3. Fuzzy similarity against individual words in the sample value
+            for w in s_words:
+                sim = difflib.SequenceMatcher(None, term_lower, w).ratio()
+                if sim >= 0.75 and sim > best_score:
+                    best_score = sim
+                    best_match = s_val
+
+            # 4. Fuzzy similarity against full sample value
+            full_sim = difflib.SequenceMatcher(None, term_lower, s_lower).ratio()
+            if full_sim >= 0.75 and full_sim > best_score:
+                best_score = full_sim
+                best_match = s_val
+
+        if best_match and best_score >= 0.75:
+            return (term, best_match)
+
+    return None
+
+
 def generate_sql(
     session_id: str,
     nl_question: str,
@@ -261,6 +386,9 @@ def generate_sql(
         dict: {
             "needs_clarification": bool,
             "clarification_question": Optional[str],
+            "needs_confirmation": bool,
+            "confirmation_question": Optional[str],
+            "suggested_value": Optional[str],
             "query_type": str,  # 'select' or 'write'
             "sql": Optional[str],
             "explanation": Optional[str],
@@ -272,6 +400,52 @@ def generate_sql(
     session = get_session(session_id)
     if not session:
         raise ValueError(f"Session '{session_id}' not found. Please connect to a database first.")
+
+    # ---------------------------------------------------------------------------
+    # Conversational follow-up: check if preceding message needed confirmation
+    # ---------------------------------------------------------------------------
+    if conversation_context and conversation_context.get("previous_confirmation"):
+        prev_conf = conversation_context["previous_confirmation"]
+        suggested_val = prev_conf.get("suggested_value")
+        norm_reply = re.sub(r"[^\w\s]", "", nl_question.strip().lower())
+
+        affirmative_terms = {
+            "yes", "yeah", "yep", "yup", "correct", "sure", "ok", "okay",
+            "please", "yes please", "confirm", "right", "exactly",
+            "aama", "aamam", "seri", "haan", "ha"
+        }
+        negative_terms = {
+            "no", "nope", "nah", "cancel", "dont", "don't", "nevermind", "illai", "illa"
+        }
+
+        if norm_reply in affirmative_terms or norm_reply.startswith("yes ") or norm_reply.startswith("yeah "):
+            logger.info("User confirmed suggestion '%s' with '%s'", suggested_val, nl_question)
+            nl_question = f"show details of patient {suggested_val}"
+            conversation_context = copy.deepcopy(conversation_context)
+            conversation_context.pop("previous_confirmation", None)
+        elif norm_reply in negative_terms or norm_reply.startswith("no "):
+            logger.info("User declined suggestion '%s' with '%s'", suggested_val, nl_question)
+            return {
+                "needs_confirmation": False,
+                "confirmation_question": None,
+                "suggested_value": None,
+                "data_available": True,
+                "unavailable_message": None,
+                "corrected_terms": [],
+                "needs_clarification": False,
+                "clarification_question": None,
+                "interpreted_text": nl_question,
+                "query_type": "select",
+                "sql": None,
+                "result": [],
+                "explanation": "Understood. Please let me know what you would like to search for instead.",
+                "confidence": 1.0,
+                "detected_language": detect_input_language(nl_question),
+            }
+        else:
+            logger.info("User provided fresh query '%s' instead of confirming '%s'", nl_question, suggested_val)
+            conversation_context = copy.deepcopy(conversation_context)
+            conversation_context.pop("previous_confirmation", None)
 
     # ---------------------------------------------------------------------------
     # Response Caching: key = SHA256(schema_sig + normalized_question + language + context)
@@ -295,6 +469,32 @@ def generate_sql(
 
     schema = session.get("schema", {})
     sample_values_map = session.get("sample_values")
+
+    # Check for near-miss value searches (did-you-mean confirmation flow)
+    near_miss = find_near_miss_value(nl_question, schema, sample_values_map)
+    if near_miss:
+        lit_val, close_val = near_miss
+        conf_q = f"I couldn't find an exact match for '{lit_val}'. Did you mean '{close_val}'? Reply yes to see that record, or provide a different name."
+        data = {
+            "needs_confirmation": True,
+            "confirmation_question": conf_q,
+            "suggested_value": close_val,
+            "literal_value": lit_val,
+            "data_available": True,
+            "unavailable_message": None,
+            "corrected_terms": [],
+            "needs_clarification": False,
+            "clarification_question": None,
+            "interpreted_text": nl_question,
+            "query_type": "select",
+            "sql": None,
+            "result": [],
+            "explanation": None,
+            "confidence": 0.85,
+            "detected_language": detect_input_language(nl_question),
+        }
+        _put_in_cache(cache_key, data)
+        return data
 
     # Schema-aware retrieval (RAG): retrieve top 3-4 most relevant tables (or all if <= 4)
     from app.services.rag_service import retrieve_relevant_tables
@@ -365,11 +565,13 @@ Instructions:
    - The user's input may come from speech recognition, which occasionally mishears words (for example: "shom me pashents older then fourty").
    - Always return an "interpreted_text" field in the JSON response with the corrected sentence.
    - If you corrected any misspelled or phonetically misheard words between the user's input and "interpreted_text", provide them in "corrected_terms" as a list of {{"original": "misheard_word", "corrected": "fixed_word"}}.
-   - CRITICAL RULES FOR corrected_terms:
-     - corrected_terms must ONLY correct words that closely match actual schema terms (table names, column names from the connected database, or common query vocabulary like "top", "average", "delete").
-     - If a word could plausibly be a data value (a proper noun, a name, capitalized mid-sentence, or simply doesn't closely resemble any schema term), it must NOT be included in corrected_terms, even if it superficially resembles a schema word.
-     - EXACT CALIBRATION EXAMPLE: "Pavai" in "delete the age of patient Pavai" is a person's name (a data value), NOT a misspelling of "patients" — do NOT flag it in corrected_terms, keep "Pavai" intact in interpreted_text, and reference the literal value 'Pavai' in a WHERE clause.
-     - Example valid schema correction: [{{"original": "paiens", "corrected": "patients"}}, {{"original": "fourty", "corrected": "forty"}}]
+   - CRITICAL RULES FOR DATA VALUES AND corrected_terms (STRICT ACCURACY AND DATA INTEGRITY RULES):
+     a. LITERAL DATA VALUES (STRICT INTEGRITY RULE): When a user's question includes what looks like a search value for a specific record (a name, an ID, a specific term being filtered on — as opposed to a schema/table/column term), the generated SQL's WHERE clause MUST use the LITERAL text the user typed (case-insensitive match is fine, e.g. LOWER(name) LIKE LOWER('%virthi%')), NEVER a different value, even if a similar-looking value exists in the sample data shown in the prompt.
+     b. NO DATA VALUE SUBSTITUTION IN corrected_terms: corrected_terms must NEVER apply to a search/filter value that would change WHICH record is being looked up. It may still correct genuine SCHEMA vocabulary typos (e.g. "paiens" -> "patients", "fourty" -> "forty"), but must NEVER silently swap "virthi" for "Karthik" or any other existing person's name or data value.
+     c. EXPLICIT CALIBRATION EXAMPLE (virthi vs Karthik): If the user searches for 'virthi' and no patient named 'virthi' exists, but a patient named 'Karthik' does exist in the database or sample values, do NOT substitute 'Karthik' for 'virthi'. Generate SQL that searches for the literal term 'virthi' (e.g. WHERE LOWER(name) LIKE '%virthi%'), and if it returns zero rows, that is the CORRECT outcome — say 'No patient found with the name \'virthi\'. Please check the spelling and try again.' rather than silently returning Karthik's data.
+     d. ZERO-ROWS REASONING ON SEARCH VALUES: When such a query returns zero rows, return a clear explanation like "No patient found with the name 'virthi'. Please check the spelling and try again." — using the ACTUAL term the user typed, not a substituted one.
+     e. EXACT CALIBRATION EXAMPLE (Pavai): "Pavai" in "delete the age of patient Pavai" is a person's name (a data value), NOT a misspelling of "patients" — do NOT flag it in corrected_terms, keep "Pavai" intact in interpreted_text, and reference the literal value 'Pavai' in a WHERE clause.
+     f. VALID SCHEMA CORRECTIONS: corrected_terms must ONLY correct words that closely match actual schema terms (table names, column names from the connected database, or common query vocabulary like "top", "average", "delete"). Example valid schema correction: [{{"original": "paiens", "corrected": "patients"}}, {{"original": "fourty", "corrected": "forty"}}]
    - If no schema words were corrected, return [].
    - Base your SQL generation on this corrected "interpreted_text".
 
@@ -495,7 +697,7 @@ Format:
 
             try:
                 data = json.loads(cleaned)
-                _validate_result(data, nl_question, filtered_schema)
+                _validate_result(data, nl_question, filtered_schema, filtered_sample_values)
                 _enforce_language(data, detected_lang, model)
                 data["relevant_tables"] = relevant_tables
                 _WORKING_MODEL = model_name
@@ -515,7 +717,7 @@ Database Schema:
 Instructions:
 1. FIRST check if the requested entity/data exists in the schema. If absent, set "data_available": false, provide "unavailable_message", set sql to null, needs_clarification: false. Do not ask for clarification if data does not exist in schema.
 2. Determine if the question needs clarification (ONLY IF data exists in schema: e.g. ranking word without metric and limit on existing tables).
-3. Fix speech-to-text mistakes in interpreted_text and list {{"original", "corrected"}} pairs in corrected_terms ONLY for schema keywords or SQL terms (never person names, proper nouns, or data values like 'Pavai').
+3. Fix speech-to-text mistakes in interpreted_text and list {{"original", "corrected"}} pairs in corrected_terms ONLY for schema keywords or SQL terms. NEVER substitute person names or data values (e.g. searching 'virthi' must use literal 'virthi' in WHERE clause, never 'Karthik').
 4. If needs_clarification is true, set sql to null, explanation to null, confidence < 0.5, and provide a short clarification_question.
 5. If valid and available, generate valid SQLite in sql, explanation, confidence >= 0.5.
 
@@ -544,7 +746,7 @@ Output ONLY raw valid JSON without markdown formatting or backticks:
                 retry_res = model.generate_content(retry_prompt, generation_config=gen_config)
                 retry_cleaned = _clean_json_string(retry_res.text or "")
                 retry_data = json.loads(retry_cleaned)
-                _validate_result(retry_data, nl_question, filtered_schema)
+                _validate_result(retry_data, nl_question, filtered_schema, filtered_sample_values)
                 _enforce_language(retry_data, detected_lang, model)
                 retry_data["relevant_tables"] = relevant_tables
                 _WORKING_MODEL = model_name
@@ -568,6 +770,9 @@ Output ONLY raw valid JSON without markdown formatting or backticks:
         "corrected_terms": _extract_word_corrections(nl_question, nl_question),
         "needs_clarification": True,
         "clarification_question": "I could not generate a SQL query for this question right now. Could you please clarify your request with more specific criteria or table names?",
+        "needs_confirmation": False,
+        "confirmation_question": None,
+        "suggested_value": None,
         "interpreted_text": nl_question,
         "sql": None,
         "explanation": None,
@@ -595,8 +800,13 @@ def _extract_word_corrections(original: str, corrected: str) -> list:
     return pairs
 
 
-def _validate_result(data: Any, nl_question: str = "", schema: Optional[Dict[str, Any]] = None) -> None:
-    """Ensure result dictionary contains required fields with expected types."""
+def _validate_result(
+    data: Any,
+    nl_question: str = "",
+    schema: Optional[Dict[str, Any]] = None,
+    sample_values: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Ensure result dictionary contains required fields with expected types and enforces data value integrity."""
     if not isinstance(data, dict):
         return
 
@@ -606,6 +816,75 @@ def _validate_result(data: Any, nl_question: str = "", schema: Optional[Dict[str
         data["interpreted_text"] = nl_question
     else:
         data["interpreted_text"] = interpreted.strip()
+
+    # Collect known schema terms (tables, columns, and standard SQL vocabulary)
+    schema_terms = set()
+    all_sample_values = set()
+    if schema:
+        for tbl, cols in schema.items():
+            schema_terms.add(tbl.lower())
+            if tbl.lower().endswith("s"):
+                schema_terms.add(tbl.lower()[:-1])
+            if isinstance(cols, list):
+                for c in cols:
+                    if isinstance(c, dict):
+                        schema_terms.add(c.get("name", "").lower())
+                        for sv in c.get("sample_values") or []:
+                            if sv is not None:
+                                sv_str = str(sv).strip().lower()
+                                if sv_str:
+                                    all_sample_values.add(sv_str)
+                                    for word in sv_str.split():
+                                        if len(word) >= 3:
+                                            all_sample_values.add(word)
+                    else:
+                        schema_terms.add(str(c).lower())
+
+    if sample_values:
+        for tbl, cols_dict in sample_values.items():
+            if isinstance(cols_dict, dict):
+                for col_name, s_list in cols_dict.items():
+                    if isinstance(s_list, list):
+                        for sv in s_list:
+                            if sv is not None:
+                                sv_str = str(sv).strip().lower()
+                                if sv_str:
+                                    all_sample_values.add(sv_str)
+                                    for word in sv_str.split():
+                                        if len(word) >= 3:
+                                            all_sample_values.add(word)
+
+    # Common valid schema / query vocabulary terms that are permitted in corrected_terms
+    common_vocab = {
+        "top", "best", "average", "avg", "count", "sum", "min", "max",
+        "delete", "remove", "clear", "update", "insert", "add", "show",
+        "list", "get", "find", "display", "select", "where", "order",
+        "group", "by", "having", "join", "inner", "left", "right",
+        "older", "younger", "greater", "less", "more", "between",
+        "recent", "all", "patient", "patients", "doctor", "doctors",
+        "appointment", "appointments", "hospital", "hospitals",
+        "customer", "customers", "order", "orders", "product", "products",
+        "forty", "fifty", "sixty", "seventy", "eighty", "ninety", "hundred"
+    }
+    schema_terms.update(common_vocab)
+
+    def _is_schema_term(term: str) -> bool:
+        t = term.lower()
+        if t in schema_terms:
+            return True
+        matches = difflib.get_close_matches(t, list(schema_terms), n=1, cutoff=0.85)
+        return len(matches) > 0
+
+    def _is_data_value(term: str) -> bool:
+        t = term.lower()
+        if t in all_sample_values:
+            return True
+        for sv in all_sample_values:
+            if t == sv or (len(t) >= 4 and t in sv) or (len(sv) >= 4 and sv in t):
+                return True
+            if difflib.SequenceMatcher(None, t, sv).ratio() >= 0.75:
+                return True
+        return False
 
     # Check if the query references a core entity completely absent from schema
     data_available = bool(data.get("data_available", True))
@@ -653,32 +932,109 @@ def _validate_result(data: Any, nl_question: str = "", schema: Optional[Dict[str
     else:
         data["unavailable_message"] = None
 
-    # Normalize corrected_terms (ensure proper nouns, names, and data values are not flagged as typos)
+    # Normalize corrected_terms & apply Bug 2 Safety Net:
+    # If corrected_terms contains an entry where "corrected" does not match schema vocabulary
+    # but matches a data value in sample_values, reject that correction (drop from corrected_terms,
+    # and revert from interpreted_text and SQL).
     corrected_terms = data.get("corrected_terms")
     valid_pairs = []
+    rejected_data_corrections = []
     sql_text = str(data.get("sql") or "").lower()
+
     if isinstance(corrected_terms, list):
         for item in corrected_terms:
             if isinstance(item, dict) and "original" in item and "corrected" in item:
                 orig = str(item["original"]).strip()
                 corr = str(item["corrected"]).strip()
                 if orig and corr and orig.lower() != corr.lower():
+                    # Check safety net: is corrected value a data value rather than schema term?
+                    if not _is_schema_term(corr) and _is_data_value(corr):
+                        logger.warning(
+                            "[Safety Net] Rejecting data value auto-correction: '%s' -> '%s' (matches sample data value). Reverting to literal user term.",
+                            orig, corr
+                        )
+                        rejected_data_corrections.append((orig, corr))
+                        continue
+
                     # Safeguard: Do not flag names or data values that appear as literal values in the generated SQL
                     orig_l = orig.lower()
                     if f"'{orig_l}'" in sql_text or f'"{orig_l}"' in sql_text or f"%{orig_l}%" in sql_text:
                         continue
                     valid_pairs.append({"original": orig, "corrected": corr})
-    # If model did not output pairs but input was corrected, derive automatically
+
+    # If model did not output pairs but input was corrected, derive automatically and filter
     if not valid_pairs and data.get("interpreted_text") and nl_question:
         extracted = _extract_word_corrections(nl_question, data["interpreted_text"])
         for p in extracted:
-            orig_l = p["original"].lower()
+            orig = p["original"]
+            corr = p["corrected"]
+            if not _is_schema_term(corr) and _is_data_value(corr):
+                logger.warning(
+                    "[Safety Net] Rejecting derived data value auto-correction: '%s' -> '%s'. Reverting to literal user term.",
+                    orig, corr
+                )
+                rejected_data_corrections.append((orig, corr))
+                continue
+            orig_l = orig.lower()
             if f"'{orig_l}'" in sql_text or f'"{orig_l}"' in sql_text or f"%{orig_l}%" in sql_text:
                 continue
             valid_pairs.append(p)
+
     data["corrected_terms"] = valid_pairs
 
+    # Revert rejected data corrections from interpreted_text, sql, and explanation
+    for orig, corr in rejected_data_corrections:
+        if data.get("interpreted_text"):
+            data["interpreted_text"] = re.sub(rf"\b{re.escape(corr)}\b", orig, data["interpreted_text"], flags=re.IGNORECASE)
+        if data.get("sql"):
+            data["sql"] = re.sub(rf"\b{re.escape(corr)}\b", orig, data["sql"], flags=re.IGNORECASE)
+        if data.get("explanation"):
+            data["explanation"] = re.sub(rf"\b{re.escape(corr)}\b", orig, data["explanation"], flags=re.IGNORECASE)
+
+    # Additional safety net: Check if SQL WHERE clause contains a sample data value not present in user query
+    if data.get("sql") and nl_question:
+        sql_str = data["sql"]
+        stop_words = {
+            "show", "me", "list", "get", "find", "all", "the", "of", "for", "with", "in",
+            "by", "on", "at", "to", "a", "an", "is", "are", "was", "were", "who", "whose",
+            "details", "record", "records", "search", "query", "check", "info", "information"
+        }
+        q_non_schema_words = [
+            w for w in re.findall(r"\b[a-zA-Z0-9_]+\b", nl_question)
+            if w.lower() not in stop_words and not _is_schema_term(w)
+        ]
+        sql_literals = re.findall(r"['\"]%?([^%'\"]+)%?['\"]", sql_str)
+        for lit in sql_literals:
+            lit_lower = lit.lower()
+            if _is_data_value(lit_lower) and not _is_schema_term(lit_lower):
+                if lit_lower not in nl_question.lower():
+                    # Sample data value was used in SQL without appearing in user question
+                    for qw in q_non_schema_words:
+                        if qw.lower() not in sql_str.lower():
+                            logger.warning(
+                                "[Safety Net] Silent data substitution detected: '%s' in SQL replaced user term '%s'. Reverting SQL to user literal.",
+                                lit, qw
+                            )
+                            data["sql"] = data["sql"].replace(lit, qw)
+                            if data.get("interpreted_text"):
+                                data["interpreted_text"] = re.sub(rf"\b{re.escape(lit)}\b", qw, data["interpreted_text"], flags=re.IGNORECASE)
+                            if data.get("explanation"):
+                                data["explanation"] = re.sub(rf"\b{re.escape(lit)}\b", qw, data["explanation"], flags=re.IGNORECASE)
+                            break
+
     if not data_available:
+        return
+
+    # Normalize confirmation and clarification fields
+    data["needs_confirmation"] = bool(data.get("needs_confirmation", False))
+    data["confirmation_question"] = data.get("confirmation_question")
+    data["suggested_value"] = data.get("suggested_value")
+
+    if data["needs_confirmation"]:
+        data["sql"] = None
+        data["explanation"] = None
+        data["needs_clarification"] = False
+        data["clarification_question"] = None
         return
 
     # Normalize needs_clarification
@@ -841,7 +1197,7 @@ Self-Check:
 
             try:
                 data = json.loads(cleaned)
-                _validate_result(data, original_question, filtered_schema)
+                _validate_result(data, original_question, filtered_schema, filtered_sample_values)
                 _enforce_language(data, detected_lang, model)
                 data["relevant_tables"] = relevant_tables
                 _WORKING_MODEL = model_name
@@ -870,7 +1226,7 @@ Output ONLY raw valid JSON:
                 retry_res = model.generate_content(retry_prompt, generation_config=gen_config)
                 retry_cleaned = _clean_json_string(retry_res.text or "")
                 retry_data = json.loads(retry_cleaned)
-                _validate_result(retry_data, original_question, filtered_schema)
+                _validate_result(retry_data, original_question, filtered_schema, filtered_sample_values)
                 _enforce_language(retry_data, detected_lang, model)
                 retry_data["relevant_tables"] = relevant_tables
                 _WORKING_MODEL = model_name
@@ -889,4 +1245,153 @@ Output ONLY raw valid JSON:
     if last_error:
         raise last_error
     raise RuntimeError("All Gemini model self-correction attempts failed.")
+
+
+def generate_zero_result_explanation(
+    question: str,
+    sql: str,
+    original_explanation: Optional[str] = None,
+    detected_language: str = "english",
+) -> str:
+    """Generate a clear, friendly explanation when a SELECT query executes successfully but returns 0 rows.
+
+    Restates the actual condition or search value that was checked:
+    - Specific name/value search: "No patient found with the name 'virthi'. Please check the spelling and try again."
+    - Criteria search: "Query executed successfully — no patients found matching 'visited in the last 5 days'."
+    """
+    # 1. Determine entity
+    q_lower = question.lower()
+    sql_lower = sql.lower()
+    if "patient" in q_lower or "patients" in q_lower or "patients" in sql_lower:
+        entity = "patient"
+        entity_plural = "patients"
+    elif "doctor" in q_lower or "doctors" in q_lower or "doctors" in sql_lower:
+        entity = "doctor"
+        entity_plural = "doctors"
+    elif "customer" in q_lower or "customers" in q_lower or "customers" in sql_lower:
+        entity = "customer"
+        entity_plural = "customers"
+    elif "product" in q_lower or "products" in q_lower or "products" in sql_lower:
+        entity = "product"
+        entity_plural = "products"
+    elif "order" in q_lower or "orders" in q_lower or "orders" in sql_lower:
+        entity = "order"
+        entity_plural = "orders"
+    elif "appointment" in q_lower or "appointments" in q_lower or "appointments" in sql_lower:
+        entity = "appointment"
+        entity_plural = "appointments"
+    else:
+        entity = "record"
+        entity_plural = "records"
+
+    # 2. Check if a specific name or literal search term was queried in SQL WHERE clause
+    # e.g. WHERE LOWER(name) LIKE '%virthi%' or WHERE name = 'xyzabc123'
+    name_col_pattern = r"(?:WHERE|AND|OR)\s+(?:LOWER\s*\(\s*)?([a-zA-Z0-9_]+)(?:\s*\))?\s*(?:LIKE|=)\s*['\"]%?([^%'\"]+)%?['\"]"
+    name_matches = re.findall(name_col_pattern, sql, re.IGNORECASE)
+
+    specific_search_val = None
+    is_name_search = False
+
+    for col_name, val in name_matches:
+        val_clean = val.strip()
+        col_lower = col_name.lower()
+        if col_lower in ("name", "patient_name", "doctor_name", "customer_name", "product_name"):
+            specific_search_val = val_clean
+            is_name_search = True
+            break
+        elif any(w.lower() == val_clean.lower() for w in re.findall(r"\b[a-zA-Z0-9_]+\b", question)):
+            # Literal value appears directly in user question and is not a common keyword
+            if val_clean.lower() not in ("completed", "scheduled", "cancelled", "male", "female", "active"):
+                specific_search_val = val_clean
+                if "name" in q_lower or entity in ("patient", "doctor", "customer"):
+                    is_name_search = True
+                break
+
+    # If not found via regex above, check if question contains a specific unquoted search token (e.g. virthi, xyzabc123)
+    if not specific_search_val:
+        stop_words = {
+            "show", "me", "list", "get", "find", "all", "the", "of", "for", "with", "in",
+            "by", "on", "at", "to", "a", "an", "is", "are", "was", "were", "who", "whose",
+            "details", "record", "records", "search", "query", "check", "info", "information",
+            "patients", "patient", "doctors", "doctor", "customers", "customer", "orders", "order",
+            "products", "product", "appointments", "appointment", "named", "name", "called"
+        }
+        tokens = [w for w in re.findall(r"\b[a-zA-Z0-9_]+\b", question) if w.lower() not in stop_words and len(w) > 2]
+        for token in tokens:
+            if token.lower() in sql_lower:
+                specific_search_val = token
+                is_name_search = True
+                break
+
+    # 3. Rule-based explanation construction
+    if specific_search_val:
+        if is_name_search:
+            explanation = f"No {entity} found with the name '{specific_search_val}'. Please check the spelling and try again."
+        else:
+            explanation = f"Query executed successfully — no {entity_plural} found matching '{specific_search_val}'."
+    else:
+        # Criteria search (e.g. "patients visited last 5 days" or "patients older than 90")
+        criteria = re.sub(
+            r"^(?:list\s+of|show\s+me|find|get|give\s+me|display|search\s+for|what\s+are\s+the|which)\s+",
+            "",
+            question.strip(),
+            flags=re.IGNORECASE,
+        ).strip()
+        if criteria.lower().startswith(entity_plural):
+            remainder = criteria[len(entity_plural):].strip()
+            if remainder.startswith("who ") or remainder.startswith("that ") or remainder.startswith("with ") or remainder.startswith("visited") or remainder.startswith("in "):
+                explanation = f"Query executed successfully — no {entity_plural} found {remainder}."
+            elif remainder:
+                explanation = f"Query executed successfully — no {entity_plural} found matching '{remainder}'."
+            else:
+                explanation = f"Query executed successfully — no {entity_plural} found."
+        elif criteria.lower().startswith(entity):
+            remainder = criteria[len(entity):].strip()
+            if remainder:
+                explanation = f"Query executed successfully — no {entity} found matching '{remainder}'."
+            else:
+                explanation = f"Query executed successfully — no {entity} found."
+        else:
+            explanation = f"Query executed successfully — no {entity_plural} found matching '{criteria}'."
+
+    # 4. Optional Gemini enhancement if model is available and query is English/complex
+    if GEMINI_API_KEY and detected_language not in ("tamil", "thanglish"):
+        try:
+            model = genai.GenerativeModel(_WORKING_MODEL)
+            zero_prompt = f"""You are an assistant reporting SQLite database query results.
+A query executed successfully against SQLite but returned 0 rows (no matching records found).
+
+User Question: "{question}"
+Executed SQL: "{sql}"
+Original Description: "{original_explanation or ''}"
+
+Write a clear, concise, user-friendly 1-sentence explanation stating that the query executed successfully but found no matching records.
+STRICT RULES:
+1. Restate the specific condition or criteria that was checked (e.g., "Query executed successfully — no patients found matching 'visited in the last 5 days'." or "No patient found with the name 'virthi'. Please check the spelling and try again.").
+2. If the user searched for a specific name, ID, or term, you MUST use the EXACT literal term the user typed (e.g., 'virthi', 'xyzabc123'). NEVER substitute it with another name or existing database record.
+3. Keep it polite, clear, and reassuring.
+4. Output ONLY the plain explanation sentence, without quotes, backticks, or JSON.
+"""
+            resp = model.generate_content(
+                zero_prompt,
+                generation_config={"temperature": 0.0, "max_output_tokens": 80},
+                request_options={"timeout": 4.0},
+            )
+            resp_text = (resp.text or "").strip().strip('"').strip("'")
+            if resp_text and len(resp_text) > 10 and not resp_text.startswith("{"):
+                # Ensure the exact search value was not mangled by Gemini
+                if not specific_search_val or specific_search_val.lower() in resp_text.lower():
+                    explanation = resp_text
+        except Exception as g_err:
+            logger.debug("Gemini zero-result explanation call failed or timed out: %s", g_err)
+
+    # 5. Language constraints
+    if detected_language == "thanglish":
+        if not (explanation.startswith("Understood —") or explanation.startswith("Understood -")):
+            explanation = f"Understood — {explanation}"
+    elif detected_language == "tamil":
+        explanation = f"வினவல் வெற்றிகரமாக செயல்படுத்தப்பட்டது — கொடுக்கப்பட்ட நிபந்தனைக்கு ஏற்ற தகவல்கள் எதுவும் கிடைக்கவில்லை."
+
+    return explanation
+
 

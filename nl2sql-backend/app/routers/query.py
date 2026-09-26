@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.models.meta_db import ConversationModel, QueryHistoryModel, get_db_session
-from app.services.sql_generator import generate_sql, regenerate_sql
+from app.services.sql_generator import generate_sql, regenerate_sql, generate_zero_result_explanation
 from app.services.sql_validator import validate_sql
 from app.services.execution_engine import run_select
 from app.services.session_store import get_session
@@ -131,6 +131,9 @@ class QueryResponse(BaseModel):
     confidence: float = 1.0
     needs_clarification: bool = False
     clarification_question: Optional[str] = None
+    needs_confirmation: bool = False
+    confirmation_question: Optional[str] = None
+    suggested_value: Optional[str] = None
     query_type: str = "select"
     result: List[Any] = []
     chart_type: str = "none"
@@ -220,10 +223,25 @@ def handle_query(
             .order_by(QueryHistoryModel.created_at.desc())
             .first()
         )
-        if last_history and last_history.generated_sql and not last_history.generated_sql.startswith("--"):
+        if last_history:
+            prev_conf = None
+            if last_history.query_type == "confirmation" and last_history.corrections_json:
+                try:
+                    cdata = json.loads(last_history.corrections_json)
+                    if cdata.get("needs_confirmation"):
+                        prev_conf = {
+                            "suggested_value": cdata.get("suggested_value"),
+                            "literal_value": cdata.get("literal_value"),
+                            "confirmation_question": last_history.explanation,
+                        }
+                except Exception as c_err:
+                    logger.warning("Could not parse previous confirmation data: %s", c_err)
+
+            prev_sql = last_history.generated_sql if (last_history.generated_sql and not last_history.generated_sql.startswith("--")) else None
             conv_context = {
                 "previous_question": last_history.nl_query,
-                "previous_sql": last_history.generated_sql,
+                "previous_sql": prev_sql,
+                "previous_confirmation": prev_conf,
             }
     except Exception as ctx_err:
         logger.warning("Could not fetch conversation context: %s", ctx_err)
@@ -344,6 +362,57 @@ def handle_query(
             confidence=confidence,
             needs_clarification=True,
             clarification_question=clarification_q,
+            needs_confirmation=False,
+            confirmation_question=None,
+            suggested_value=None,
+            query_type="select",
+            result=[],
+            chart_type="none",
+            interpreted_text=interpreted_text,
+            detected_language=detected_lang,
+            data_available=True,
+            unavailable_message=None,
+            corrected_terms=corrected_terms,
+        )
+
+    # Handle confirmation flow for near-miss values before execution
+    if gen_data.get("needs_confirmation", False):
+        sugg_val = gen_data.get("suggested_value")
+        conf_q = gen_data.get("confirmation_question") or f"Did you mean '{sugg_val}'?"
+        confidence = float(gen_data.get("confidence", 0.85))
+
+        query_record = QueryHistoryModel(
+            session_id=payload.session_id,
+            conversation_id=conv.id,
+            nl_query=payload.text,
+            generated_sql=f"-- Needs confirmation: {sugg_val}" if sugg_val else "-- Needs confirmation",
+            explanation=conf_q,
+            result_json="[]",
+            chart_type="none",
+            confidence=confidence,
+            query_type="confirmation",
+            corrections_json=json.dumps({
+                "needs_confirmation": True,
+                "suggested_value": sugg_val,
+                "literal_value": gen_data.get("literal_value") or payload.text,
+                "confirmation_question": conf_q,
+            }),
+            created_at=datetime.utcnow(),
+        )
+        db.add(query_record)
+        db.commit()
+        db.refresh(query_record)
+
+        return QueryResponse(
+            query_id=str(query_record.id),
+            sql=None,
+            explanation=None,
+            confidence=confidence,
+            needs_clarification=False,
+            clarification_question=None,
+            needs_confirmation=True,
+            confirmation_question=conf_q,
+            suggested_value=sugg_val,
             query_type="select",
             result=[],
             chart_type="none",
@@ -628,6 +697,15 @@ def handle_query(
         )
 
     # Success (either on first attempt or after self-correction)
+    # Bug 1 Fix: Zero-row reasoning for successful SELECT queries
+    if isinstance(exec_result, list) and len(exec_result) == 0:
+        current_explanation = generate_zero_result_explanation(
+            question=payload.text,
+            sql=current_sql,
+            original_explanation=current_explanation,
+            detected_language=detected_lang,
+        )
+
     query_record = QueryHistoryModel(
         session_id=payload.session_id,
         conversation_id=conv.id,
