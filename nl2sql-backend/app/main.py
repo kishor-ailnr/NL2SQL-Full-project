@@ -34,20 +34,20 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["X-XSS-Protection"] = "1; mode=block"
         # CSP for a single-page application served from its own origin.
-        # - default-src 'self'       → all resources must come from same origin
-        # - script-src 'self'        → only same-origin JS (no inline, no CDN)
-        # - style-src 'self' 'unsafe-inline' → allow component-scoped styles
-        # - img-src 'self' data:     → allow base64-encoded images (chart blobs)
-        # - font-src 'self'          → same-origin fonts
-        # - connect-src 'self'       → XHR/fetch only to same origin
-        # - frame-ancestors 'none'   → equivalent of X-Frame-Options: DENY for CSP3
+        # - default-src 'self'                   → default same-origin
+        # - script-src 'self' 'unsafe-inline'    → allow SPA bootstrap and inline scripts
+        # - style-src 'self' 'unsafe-inline' https://fonts.googleapis.com → allow component styles and Google Fonts CSS
+        # - img-src 'self' data: blob: https:    → allow chart blobs, avatars, data URIs
+        # - font-src 'self' data: https://fonts.gstatic.com → allow local and Google Fonts webfonts
+        # - connect-src 'self' https:            → allow backend API calls and external services
+        # - frame-ancestors 'none'               → equivalent of X-Frame-Options: DENY for CSP3
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
-            "script-src 'self'; "
-            "style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data:; "
-            "font-src 'self'; "
-            "connect-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "img-src 'self' data: blob: https:; "
+            "font-src 'self' data: https://fonts.gstatic.com; "
+            "connect-src 'self' https:; "
             "frame-ancestors 'none';"
         )
         return response
