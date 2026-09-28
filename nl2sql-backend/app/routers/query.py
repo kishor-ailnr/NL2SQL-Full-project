@@ -221,10 +221,53 @@ def handle_query(
 
     session = get_session(payload.session_id)
     if not session:
-        raise HTTPException(
-            status_code=404,
-            detail="Active session not found. Please connect to a database first.",
-        )
+        # Auto-heal: If session was lost (e.g. server restart/redeploy on Render),
+        # attempt to auto-recover demo database so users are never blocked with a 404
+        from app.routers.connect_db import get_demo_schema
+        text_lower = (payload.text or "").lower()
+        if any(w in text_lower for w in ["product", "order", "customer", "category", "ecommerce", "price", "sale", "inventory"]):
+            demo_name = "ecommerce"
+        else:
+            demo_name = "hospital"
+
+        cached_demo = get_demo_schema(demo_name)
+        if cached_demo:
+            session = {
+                "db_type": "demo",
+                "demo_name": demo_name,
+                "db_path": cached_demo["db_path"],
+                "database_url": cached_demo["database_url"],
+                "tables": cached_demo["tables"],
+                "schema": cached_demo["schema"],
+                "sample_values": cached_demo.get("sample_values", {}),
+            }
+            from app.services.session_store import set_session
+            set_session(payload.session_id, session)
+            try:
+                from app.database.manager import DatabaseConnectionManager
+                from app.database.sqlite_adapter import SQLiteAdapter
+                demo_adapter = SQLiteAdapter(database_url=cached_demo["database_url"], db_path=cached_demo["db_path"])
+                DatabaseConnectionManager.register_adapter(payload.session_id, demo_adapter)
+            except Exception:
+                pass
+            try:
+                from app.models.meta_db import SessionModel
+                existing_rec = db.query(SessionModel).filter(SessionModel.id == payload.session_id).first()
+                if not existing_rec:
+                    s_rec = SessionModel(
+                        id=payload.session_id,
+                        db_type=f"demo_{demo_name}",
+                        connected_at=datetime.utcnow(),
+                    )
+                    db.add(s_rec)
+                    db.commit()
+            except Exception:
+                pass
+        else:
+            raise HTTPException(
+                status_code=404,
+                detail="Active session not found. Please connect to a database first.",
+            )
 
     # Ensure conversation exists; if omitted or not found, auto-create under this session
     target_conv_id = payload.conversation_id

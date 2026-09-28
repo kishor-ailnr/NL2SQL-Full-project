@@ -14,9 +14,11 @@ if (typeof window !== 'undefined') {
         return playPromise.catch((error) => {
           if (
             error.name === 'AbortError' ||
-            error.message?.includes('interrupted by a call to pause')
+            error.name === 'NotSupportedError' ||
+            error.message?.includes('interrupted by a call to pause') ||
+            error.message?.includes('no supported source was found')
           ) {
-            // Expected browser behavior when pause() is called before play() finishes; safely ignore.
+            // Expected browser behavior when audio fails to load or pause is called; safely ignore.
             return;
           }
           throw error;
@@ -26,11 +28,16 @@ if (typeof window !== 'undefined') {
     };
   }
 
-  // Prevent uncaught promise rejection from logging AbortError to console
+  // Prevent uncaught promise rejection from logging AbortError or NotSupportedError to console
   window.addEventListener('unhandledrejection', (event) => {
+    const reason = event.reason;
+    const str = String(reason?.message || reason || '');
     if (
-      event.reason?.name === 'AbortError' ||
-      event.reason?.message?.includes('interrupted by a call to pause')
+      reason?.name === 'AbortError' ||
+      reason?.name === 'NotSupportedError' ||
+      str.includes('interrupted by a call to pause') ||
+      str.includes('no supported source was found') ||
+      str.includes('NotSupportedError')
     ) {
       event.preventDefault();
     }

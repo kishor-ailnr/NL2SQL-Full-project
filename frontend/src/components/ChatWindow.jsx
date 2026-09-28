@@ -16,6 +16,7 @@ import {
   getConversationMessages,
   deleteConversation,
   getDatabaseSchema,
+  connectDB,
 } from '../api/client';
 import { formatAssistantMessage } from '../utils/messageFormatter';
 import { AiLoadingState } from './lightswind/ai-loading-state';
@@ -27,7 +28,7 @@ const INITIAL_WELCOME = {
   timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
 };
 
-export default function ChatWindow({ session, onDisconnect }) {
+export default function ChatWindow({ session, onDisconnect, onSessionUpdate }) {
   const sessionId = session?.session_id || 'N/A';
   const tables = session?.tables || [];
 
@@ -313,12 +314,60 @@ export default function ChatWindow({ session, onDisconnect }) {
     setIsPending(true);
 
     try {
-      const queryResponse = await sendQuery({
-        session_id: sessionId,
-        conversation_id: targetConvId,
-        text,
-        language: 'auto',
-      });
+      let currentSessionId = sessionId;
+      let queryResponse;
+
+      try {
+        queryResponse = await sendQuery({
+          session_id: currentSessionId,
+          conversation_id: targetConvId,
+          text,
+          language: 'auto',
+        });
+      } catch (firstErr) {
+        const isSessionLost =
+          firstErr.message?.includes('Active session not found') ||
+          firstErr.message?.includes('session expired') ||
+          firstErr.message?.includes('404') ||
+          firstErr.status === 404;
+
+        if (isSessionLost && (session?.db_type === 'demo' || !session?.db_type)) {
+          console.log('Session expired on server, auto-reconnecting demo database...');
+          try {
+            const newSession = await connectDB({
+              db_type: 'demo',
+              demo_name: session?.demo_name || 'hospital',
+            });
+            if (newSession?.session_id) {
+              currentSessionId = newSession.session_id;
+              const merged = {
+                ...session,
+                ...newSession,
+                status: 'connected',
+              };
+              try {
+                localStorage.setItem('nl2sql_session', JSON.stringify(merged));
+              } catch (e) {}
+              if (onSessionUpdate) {
+                onSessionUpdate(merged);
+              }
+              // Transparently retry with the new session
+              queryResponse = await sendQuery({
+                session_id: currentSessionId,
+                conversation_id: null,
+                text,
+                language: 'auto',
+              });
+            } else {
+              throw firstErr;
+            }
+          } catch (reconnectErr) {
+            throw firstErr;
+          }
+        } else {
+          throw firstErr;
+        }
+      }
 
       // Update matching user message with interpreted_text and corrected_terms if returned
       if (
@@ -369,10 +418,16 @@ export default function ChatWindow({ session, onDisconnect }) {
       fetchConversations(false);
     } catch (err) {
       console.warn('sendQuery API error:', err.message);
+      const isLost =
+        err.message?.includes('Active session not found') ||
+        err.message?.includes('session expired');
+
       const errorMessage = {
         id: `err-${Date.now()}`,
         role: 'assistant',
-        content: `❌ ${err.message}`,
+        content: isLost
+          ? '⚠️ The server was restarted and your session expired. Please click "Disconnect" in the top bar to reconnect to your database.'
+          : `❌ ${err.message}`,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       };
       setMessages((prev) => [...prev, errorMessage]);

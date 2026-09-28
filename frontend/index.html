@@ -18,7 +18,14 @@
                   // Immediately mark native promise handled in V8 engine
                   p.catch(function() {});
                   return p.catch(function(err) {
-                    if (err && (err.name === 'AbortError' || (String(err).indexOf('pause') !== -1))) {
+                    if (
+                      err &&
+                      (err.name === 'AbortError' ||
+                       err.name === 'NotSupportedError' ||
+                       String(err).indexOf('pause') !== -1 ||
+                       String(err).indexOf('NotSupportedError') !== -1 ||
+                       String(err).indexOf('no supported source was found') !== -1)
+                    ) {
                       return;
                     }
                     return Promise.reject(err);
@@ -26,7 +33,12 @@
                 }
                 return p;
               } catch (e) {
-                if (e && (e.name === 'AbortError' || (String(e).indexOf('pause') !== -1))) {
+                if (
+                  e &&
+                  (e.name === 'AbortError' ||
+                   e.name === 'NotSupportedError' ||
+                   String(e).indexOf('pause') !== -1)
+                ) {
                   return Promise.resolve();
                 }
                 throw e;
@@ -36,7 +48,13 @@
           window.addEventListener('unhandledrejection', function(event) {
             var r = event ? (event.reason || event) : null;
             var str = String(r || '');
-            if ((r && r.name === 'AbortError') || str.indexOf('interrupted by a call to pause') !== -1 || str.indexOf('AbortError') !== -1) {
+            if (
+              (r && (r.name === 'AbortError' || r.name === 'NotSupportedError')) ||
+              str.indexOf('interrupted by a call to pause') !== -1 ||
+              str.indexOf('AbortError') !== -1 ||
+              str.indexOf('NotSupportedError') !== -1 ||
+              str.indexOf('no supported source was found') !== -1
+            ) {
               event.preventDefault();
               if (typeof event.stopImmediatePropagation === 'function') {
                 event.stopImmediatePropagation();

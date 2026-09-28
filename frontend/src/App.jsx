@@ -177,7 +177,11 @@ export default function App() {
             <ConnectDBScreen onConnected={handleConnected} initialNotice={sessionExpiredNotice} />
           </div>
         ) : (
-          <ChatWindow session={session} onDisconnect={handleDisconnect} />
+          <ChatWindow
+            session={session}
+            onDisconnect={handleDisconnect}
+            onSessionUpdate={handleConnected}
+          />
         )}
       </main>
 

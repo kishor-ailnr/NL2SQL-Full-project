@@ -36,6 +36,13 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
                     "sample_values": cached.get("sample_values", {}),
                 }
                 SESSION_STORE[session_id] = restored
+                try:
+                    from app.database.manager import DatabaseConnectionManager
+                    from app.database.sqlite_adapter import SQLiteAdapter
+                    demo_adapter = SQLiteAdapter(database_url=cached["database_url"], db_path=cached["db_path"])
+                    DatabaseConnectionManager.register_adapter(session_id, demo_adapter)
+                except Exception:
+                    pass
                 return restored
         elif record and record.db_type.startswith("upload_"):
             db_path = DATA_DIR / f"{record.db_type}.db"
@@ -52,6 +59,13 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
                     "sample_values": sample_values_map,
                 }
                 SESSION_STORE[session_id] = restored
+                try:
+                    from app.database.manager import DatabaseConnectionManager
+                    from app.database.sqlite_adapter import SQLiteAdapter
+                    upload_adapter = SQLiteAdapter(database_url=f"sqlite:///{db_path.as_posix()}", db_path=db_path)
+                    DatabaseConnectionManager.register_adapter(session_id, upload_adapter)
+                except Exception:
+                    pass
                 return restored
     except Exception:
         pass
