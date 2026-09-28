@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import ConnectDBScreen from './components/ConnectDBScreen';
 import ChatWindow from './components/ChatWindow';
 import HelpSidebar from './components/HelpSidebar';
-import { getSessionStatus } from './api/client';
+import { getSessionStatus, connectDB } from './api/client';
 import logoImg from './assets/logo.png';
 
 export default function App() {
@@ -15,6 +15,7 @@ export default function App() {
   // Check and restore persisted session from localStorage on mount
   useEffect(() => {
     const restoreSession = async () => {
+      let storedData = null;
       try {
         const storedStr = localStorage.getItem('nl2sql_session');
         if (!storedStr) {
@@ -22,7 +23,7 @@ export default function App() {
           return;
         }
 
-        const storedData = JSON.parse(storedStr);
+        storedData = JSON.parse(storedStr);
         if (!storedData?.session_id) {
           localStorage.removeItem('nl2sql_session');
           setIsRestoringSession(false);
@@ -40,10 +41,45 @@ export default function App() {
           setSession(mergedSession);
           setScreen('chat');
           setSessionExpiredNotice('');
+        } else if (storedData.db_type === 'demo' && storedData.demo_name) {
+          // Seamlessly re-connect demo session if expired
+          const reconnected = await connectDB({
+            db_type: 'demo',
+            demo_name: storedData.demo_name,
+          });
+          const mergedSession = {
+            ...storedData,
+            ...reconnected,
+            status: 'connected',
+          };
+          localStorage.setItem('nl2sql_session', JSON.stringify(mergedSession));
+          setSession(mergedSession);
+          setScreen('chat');
+          setSessionExpiredNotice('');
         } else {
           throw new Error('Your previous session expired, please reconnect.');
         }
       } catch (err) {
+        if (storedData?.db_type === 'demo' && storedData?.demo_name) {
+          try {
+            const reconnected = await connectDB({
+              db_type: 'demo',
+              demo_name: storedData.demo_name,
+            });
+            const mergedSession = {
+              ...storedData,
+              ...reconnected,
+              status: 'connected',
+            };
+            localStorage.setItem('nl2sql_session', JSON.stringify(mergedSession));
+            setSession(mergedSession);
+            setScreen('chat');
+            setSessionExpiredNotice('');
+            return;
+          } catch (reconnectErr) {
+            console.warn('Demo session auto-reconnect fallback failed:', reconnectErr.message);
+          }
+        }
         console.warn('Session restoration failed:', err.message);
         localStorage.removeItem('nl2sql_session');
         setSession(null);

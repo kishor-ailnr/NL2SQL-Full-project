@@ -39,6 +39,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # - style-src 'self' 'unsafe-inline' https://fonts.googleapis.com → allow component styles and Google Fonts CSS
         # - img-src 'self' data: blob: https:    → allow chart blobs, avatars, data URIs
         # - font-src 'self' data: https://fonts.gstatic.com → allow local and Google Fonts webfonts
+        # - media-src 'self' data: blob:         → allow audio notifications, Web Speech, base64 sound
         # - connect-src 'self' https:            → allow backend API calls and external services
         # - frame-ancestors 'none'               → equivalent of X-Frame-Options: DENY for CSP3
         response.headers["Content-Security-Policy"] = (
@@ -47,6 +48,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
             "img-src 'self' data: blob: https:; "
             "font-src 'self' data: https://fonts.gstatic.com; "
+            "media-src 'self' data: blob:; "
             "connect-src 'self' https:; "
             "frame-ancestors 'none';"
         )

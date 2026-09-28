@@ -49,6 +49,10 @@ class TestSecurityHeaders:
         csp = self._headers(client).get("Content-Security-Policy", "")
         assert "default-src 'self'" in csp
 
+    def test_csp_media_src(self, client):
+        csp = self._headers(client).get("Content-Security-Policy", "")
+        assert "media-src 'self' data: blob:" in csp
+
     def test_referrer_policy_present(self, client):
         assert "Referrer-Policy" in self._headers(client)
 
