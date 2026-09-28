@@ -5,13 +5,18 @@ import uuid
 from collections import defaultdict
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Union
-import google.generativeai as genai
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.models.meta_db import ConversationModel, QueryHistoryModel, get_db_session
-from app.services.sql_generator import generate_sql, regenerate_sql, generate_zero_result_explanation
+from app.services.sql_generator import (
+    generate_sql,
+    regenerate_sql,
+    generate_zero_result_explanation,
+    extract_entity_conjunctions,
+    evaluate_multi_entity_results,
+)
 from app.services.sql_validator import validate_sql
 from app.services.execution_engine import run_select
 from app.services.session_store import get_session
@@ -709,8 +714,46 @@ def handle_query(
         )
 
     # Success (either on first attempt or after self-correction)
-    # Bug 1 Fix: Zero-row reasoning for successful SELECT queries
-    if isinstance(exec_result, list) and len(exec_result) == 0:
+    needs_clarif = False
+    clarif_q = None
+    data_avail = True
+    unavail_msg = None
+
+    # Check multi-entity independent evaluation & partial success handling
+    conjunction = extract_entity_conjunctions(payload.text)
+    if conjunction and isinstance(exec_result, list):
+        # Extract all sample names from session
+        all_samples = []
+        if session.get("sample_values"):
+            for tbl, cols in session["sample_values"].items():
+                for col, vals in (cols or {}).items():
+                    if "name" in col.lower():
+                        all_samples.extend([str(v) for v in vals if v])
+        if session.get("schema"):
+            for tbl, cols in session["schema"].items():
+                if isinstance(cols, list):
+                    for c in cols:
+                        if isinstance(c, dict) and "name" in c.get("name", "").lower():
+                            for sv in c.get("sample_values") or []:
+                                if sv:
+                                    all_samples.append(str(sv))
+        multi_entity_eval = evaluate_multi_entity_results(conjunction, exec_result, all_samples)
+        current_explanation = multi_entity_eval["explanation"]
+
+        if multi_entity_eval["found_count"] == 0:
+            if multi_entity_eval["has_clarification"]:
+                needs_clarif = True
+                clarif_q = multi_entity_eval["clarification_question"]
+            else:
+                data_avail = False
+                unavail_msg = f"No data is available for the requested {conjunction.get('entity_type', 'patient')} names/credentials."
+        else:
+            # Partial or full success!
+            if multi_entity_eval["has_clarification"]:
+                needs_clarif = True
+                clarif_q = multi_entity_eval["clarification_question"]
+
+    elif isinstance(exec_result, list) and len(exec_result) == 0:
         current_explanation = generate_zero_result_explanation(
             question=payload.text,
             sql=current_sql,
@@ -742,8 +785,8 @@ def handle_query(
         sql=current_sql,
         explanation=current_explanation,
         confidence=current_confidence,
-        needs_clarification=False,
-        clarification_question=None,
+        needs_clarification=needs_clarif,
+        clarification_question=clarif_q,
         query_type="select",
         result=exec_result or [],
         chart_type="none",
@@ -751,8 +794,8 @@ def handle_query(
         detected_language=detected_lang,
         self_corrected=self_corrected,
         correction_attempts=attempt,
-        data_available=True,
-        unavailable_message=None,
+        data_available=data_avail,
+        unavailable_message=unavail_msg,
         corrected_terms=corrected_terms,
     )
 

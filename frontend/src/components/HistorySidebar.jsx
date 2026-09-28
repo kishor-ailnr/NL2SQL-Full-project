@@ -1,28 +1,6 @@
 import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 
-function formatRelativeTime(dateStr) {
-  if (!dateStr) return '';
-  try {
-    const date = new Date(dateStr.replace(' ', 'T'));
-    if (isNaN(date.getTime())) return dateStr;
-    const now = new Date();
-    const diffSec = Math.floor((now.getTime() - date.getTime()) / 1000);
-
-    if (diffSec < 60) return 'Just now';
-    const diffMin = Math.floor(diffSec / 60);
-    if (diffMin < 60) return `${diffMin}m ago`;
-    const diffHour = Math.floor(diffMin / 60);
-    if (diffHour < 24) return `${diffHour}h ago`;
-    const diffDays = Math.floor(diffHour / 24);
-    if (diffDays < 7) return `${diffDays}d ago`;
-
-    return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
-  } catch {
-    return dateStr;
-  }
-}
-
 export default function HistorySidebar({
   isOpen,
   onClose,
@@ -233,9 +211,6 @@ export default function HistorySidebar({
                           </div>
                         )}
                       </div>
-                      <span className="text-[10px] text-slate-400 mt-1 block">
-                        {formatRelativeTime(item.created_at)}
-                      </span>
                     </div>
                   );
                 })

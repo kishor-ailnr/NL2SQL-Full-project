@@ -11,7 +11,6 @@ Key fixtures:
 """
 
 import pytest
-from starlette.testclient import TestClient
 
 from app.main import app
 from app.routers.query import reset_rate_limits
@@ -29,6 +28,7 @@ def client():
     Uses function scope so each test gets a clean request state.
     The TestClient calls lifespan startup/shutdown (init_db, preload_demo_cache).
     """
+    from starlette.testclient import TestClient
     with TestClient(app, raise_server_exceptions=True) as c:
         yield c
 

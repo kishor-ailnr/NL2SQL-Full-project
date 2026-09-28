@@ -6,18 +6,21 @@ import logging
 import re
 import time
 import warnings
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Union, Tuple
 from app.config import GEMINI_API_KEY
 from app.services.session_store import get_session
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-import google.generativeai as genai
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
 logger = logging.getLogger(__name__)
 
 # Configure Gemini client if API key is present
-if GEMINI_API_KEY:
+if GEMINI_API_KEY and genai:
     genai.configure(api_key=GEMINI_API_KEY, transport="rest")
 
 # Prioritized list of active Gemini models (fastest and available first)
@@ -384,6 +387,298 @@ def find_table_for_value(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Multi-Entity Conjunctions & Result Matching (AND / OR)
+# ---------------------------------------------------------------------------
+
+ATTRIBUTE_FILTER_KEYWORDS = {
+    "age", "gender", "male", "female", "older", "younger", "above", "below",
+    "greater", "less", "more", "between", "diagnosis", "disease", "condition",
+    "diabetic", "diabetes", "hypertensive", "hypertension", "fever", "cancer",
+    "admitted", "admission", "date", "status", "scheduled", "completed", "cancelled",
+    "count", "average", "avg", "sum", "total", "top", "limit", "min", "max",
+    "department", "salary", "price", "cost", "bill", "billing", "paid", "unpaid",
+    "amount", "years", "year", "months", "month", "days", "day"
+}
+
+DISCARD_WORDS = {
+    "the", "all", "details", "record", "records", "data", "info", "information",
+    "show", "list", "get", "find", "view", "display", "check", "search"
+}
+
+
+def clean_entity_term(term: str) -> str:
+    """Normalize and clean a candidate entity string from a conjunction clause."""
+    t = term.strip()
+    t = re.sub(r"^(?:details\s+of|records?\s+of|info\s+of|data\s+of)\s+", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"^the\s+", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"^[^\w]+|[^\w]+$", "", t)
+    return t.strip()
+
+
+def extract_entity_conjunctions(nl_question: str) -> Optional[Dict[str, Any]]:
+    """Detect natural language entity conjunctions (AND / OR) between multiple requested entities.
+
+    Distinguishes entity conjunctions (e.g. 'patient 1 and patient 2', 'Alice & Bob',
+    'patient A as well as patient B', 'A, B and C', 'patient 1 or patient 2')
+    from boolean attribute filter conjunctions (e.g. 'diabetic and above 60', 'age > 50 and gender = female').
+
+    Returns a dict with:
+        operator: 'AND' | 'OR'
+        entity_type: 'patient' | 'doctor' | 'customer' | 'product' | 'record'
+        entities: list of clean entity strings
+        original_query: str
+    or None if the question is not a multi-entity query.
+    """
+    if not nl_question or not nl_question.strip():
+        return None
+    q = nl_question.strip()
+    q_lower = q.lower()
+
+    if ";" in q:
+        return None
+
+    # Reject queries with explicit comparison operators (attribute filters like age > 50)
+    if re.search(r"[><=]|>=|<=", q):
+        return None
+
+    # Reject aggregation queries (e.g. "count of patients and count of doctors")
+    if re.search(r"\b(?:count|average|avg|sum|total)\b", q_lower):
+        return None
+
+    # Standardize conjunction connectors
+    normalized_q = re.sub(r"\b(?:as\s+well\s+as|along\s+with)\b", " and ", q, flags=re.IGNORECASE)
+    normalized_q = re.sub(r"\s*&\s*", " and ", normalized_q)
+
+    has_or = bool(re.search(r"\b(?:or)\b", normalized_q, flags=re.IGNORECASE))
+    has_and = bool(re.search(r"\b(?:and)\b", normalized_q, flags=re.IGNORECASE))
+
+    if not has_and and not has_or and "," not in normalized_q:
+        return None
+
+    if has_or and not has_and:
+        op = "OR"
+        split_pattern = r"\b(?:or)\b"
+    else:
+        op = "AND"
+        split_pattern = r"\b(?:and)\b"
+
+    prefix_pattern = r"^(?:give\s+(?:me\s+)?(?:the\s+)?(?:details|records?|data|info)?\s*(?:of)?|show\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?(?:details|records?|data|info)?\s*(?:of)?|display|view|list|find|compare|search\s+for)\s*"
+    stripped_q = re.sub(prefix_pattern, "", normalized_q.strip(), flags=re.IGNORECASE).strip()
+
+    entity_type = "record"
+    if re.search(r"\bpatients?\b", q_lower):
+        entity_type = "patient"
+    elif re.search(r"\bdoctors?\b", q_lower):
+        entity_type = "doctor"
+    elif re.search(r"\bcustomers?\b", q_lower):
+        entity_type = "customer"
+    elif re.search(r"\bproducts?\b", q_lower):
+        entity_type = "product"
+
+    parts = re.split(split_pattern, stripped_q, flags=re.IGNORECASE)
+    raw_entities = []
+    for p in parts:
+        subparts = [sp.strip() for sp in p.split(",") if sp.strip()]
+        raw_entities.extend(subparts)
+
+    entities = []
+    for raw in raw_entities:
+        c = clean_entity_term(raw)
+        if c:
+            words = set(re.findall(r"\b\w+\b", c.lower()))
+            if words.intersection(ATTRIBUTE_FILTER_KEYWORDS):
+                return None
+            if c.lower() not in DISCARD_WORDS and len(c) >= 1:
+                entities.append(c)
+
+    if len(entities) >= 2:
+        return {
+            "operator": op,
+            "entity_type": entity_type,
+            "entities": entities,
+            "original_query": q,
+        }
+    return None
+
+
+def fix_mutually_exclusive_and(sql: str) -> str:
+    """Detect and convert mutually exclusive AND conditions on the same column to OR.
+
+    e.g. WHERE name = 'Alice' AND name = 'Bob' -> WHERE name = 'Alice' OR name = 'Bob'
+    e.g. WHERE LOWER(name) = 'alice' AND LOWER(name) = 'bob' -> WHERE LOWER(name) = 'alice' OR LOWER(name) = 'bob'
+    e.g. WHERE id = 1 AND id = 2 -> WHERE id = 1 OR id = 2
+    Preserves range conditions (e.g. age > 20 AND age < 50) and cross-column filters (diagnosis = 'X' AND age > 60).
+    """
+    if not sql or " AND " not in sql.upper():
+        return sql
+
+    pattern = r"((?:LOWER\s*\(\s*)?(\w+)(?:\s*\))?\s*=\s*(?:'[^']*'|\d+))\s+AND\s+((?:LOWER\s*\(\s*)?\2(?:\s*\))?\s*=\s*(?:'[^']*'|\d+))"
+    current = sql
+    for _ in range(5):
+        new_sql = re.sub(pattern, r"\1 OR \3", current, flags=re.IGNORECASE)
+        if new_sql == current:
+            break
+        current = new_sql
+    return current
+
+
+def match_entity_to_rows(entity: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Match a requested entity (by name, core name, or integer ID) to database rows."""
+    matched = []
+    e_clean = entity.strip().lower()
+    e_core = get_core_person_name(entity)
+
+    id_match = re.search(r"\b(\d+)\b", e_clean)
+    target_id = int(id_match.group(1)) if id_match else None
+
+    for row in rows:
+        # Match by ID
+        if target_id is not None and "id" in row:
+            try:
+                if int(row["id"]) == target_id:
+                    matched.append(row)
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+        # Match by name column
+        row_matched = False
+        for col, val in row.items():
+            if "name" in col.lower() and isinstance(val, str):
+                v_clean = val.strip().lower()
+                v_core = get_core_person_name(val)
+                if (
+                    e_clean == v_clean
+                    or (e_core and e_core == v_core)
+                    or (len(e_core) >= 3 and e_core in v_clean)
+                    or (len(v_core) >= 3 and v_core in e_clean)
+                ):
+                    matched.append(row)
+                    row_matched = True
+                    break
+        if row_matched:
+            continue
+
+    return matched
+
+
+def find_entity_candidate(entity: str, all_sample_names: List[str]) -> Optional[str]:
+    """Find a fuzzy/near-miss candidate for an unavailable entity in known sample names."""
+    e_clean = entity.strip().lower()
+    e_core = get_core_person_name(entity)
+    best_candidate = None
+    best_score = 0.0
+
+    for s_name in all_sample_names:
+        s_clean = s_name.strip().lower()
+        s_core = get_core_person_name(s_name)
+
+        if e_clean == s_clean or (e_core and e_core == s_core):
+            continue
+
+        if e_core and s_core:
+            sim = difflib.SequenceMatcher(None, e_core, s_core).ratio()
+            if sim >= 0.75 and sim > best_score:
+                best_score = sim
+                best_candidate = s_name
+
+        sim_full = difflib.SequenceMatcher(None, e_clean, s_clean).ratio()
+        if sim_full >= 0.75 and sim_full > best_score:
+            best_score = sim_full
+            best_candidate = s_name
+
+    return best_candidate if best_score >= 0.75 else None
+
+
+def evaluate_multi_entity_results(
+    conjunction_info: Dict[str, Any],
+    exec_result: List[Dict[str, Any]],
+    all_sample_names: List[str],
+) -> Dict[str, Any]:
+    """Evaluate database execution results against all requested entities independently.
+
+    Provides complete partial success tracking, candidate matching, and structured explanations.
+    """
+    entities = conjunction_info.get("entities", [])
+    operator = conjunction_info.get("operator", "AND")
+    entity_type = conjunction_info.get("entity_type", "patient")
+
+    entity_evaluations = []
+    found_count = 0
+    missing_count = 0
+
+    for ent in entities:
+        matched_rows = match_entity_to_rows(ent, exec_result) if exec_result else []
+        if matched_rows:
+            found_count += 1
+            entity_evaluations.append({
+                "entity": ent,
+                "status": "FOUND",
+                "rows": matched_rows,
+                "candidate": None,
+            })
+        else:
+            missing_count += 1
+            cand = find_entity_candidate(ent, all_sample_names)
+            entity_evaluations.append({
+                "entity": ent,
+                "status": "NOT_FOUND",
+                "rows": [],
+                "candidate": cand,
+            })
+
+    lines = []
+    has_clarification = False
+    clarification_question = None
+
+    if found_count == len(entities):
+        lines.append(f"Found matching details for all requested {entity_type}s:")
+        for idx, ev in enumerate(entity_evaluations, 1):
+            names = [r.get("name", ev["entity"]) for r in ev["rows"]]
+            lines.append(f"{idx}. {ev['entity']}: Found ({', '.join(str(n) for n in names)})")
+    elif found_count > 0:
+        found_names = [ev["entity"] for ev in entity_evaluations if ev["status"] == "FOUND"]
+        lines.append(f"I found data for {', '.join(found_names)}.")
+
+        candidates_to_clarify = []
+        for ev in entity_evaluations:
+            if ev["status"] == "NOT_FOUND":
+                if ev["candidate"]:
+                    lines.append(f"For {ev['entity']}, I couldn't find an exact match. Possible match: '{ev['candidate']}'.")
+                    candidates_to_clarify.append(f"Did you mean '{ev['candidate']}' for '{ev['entity']}'?")
+                else:
+                    lines.append(f"No matching data was found for {ev['entity']}.")
+
+        if candidates_to_clarify:
+            has_clarification = True
+            clarification_question = " ".join(candidates_to_clarify) + " Would you like me to use this record?"
+    else:
+        candidates = [(ev["entity"], ev["candidate"]) for ev in entity_evaluations if ev["candidate"]]
+        if candidates:
+            has_clarification = True
+            cand_phrases = [f"Did you mean '{c}' for '{e}'?" for e, c in candidates]
+            clarification_question = " ".join(cand_phrases)
+            lines.append(f"I couldn't find exact matches for the requested {entity_type}s.")
+            for e, c in candidates:
+                lines.append(f"- Possible match for '{e}': '{c}'")
+        else:
+            lines.append(f"No matching data was found for the requested {entity_type}s.")
+
+    explanation = "\n\n".join(lines)
+
+    return {
+        "entity_evaluations": entity_evaluations,
+        "found_count": found_count,
+        "missing_count": missing_count,
+        "total_count": len(entities),
+        "explanation": explanation,
+        "has_clarification": has_clarification,
+        "clarification_question": clarification_question,
+        "data_available": found_count > 0 or has_clarification,
+    }
+
+
 def find_near_miss_value(
     nl_question: str,
     schema: Optional[Dict[str, Any]],
@@ -395,6 +690,10 @@ def find_near_miss_value(
     or None if exact match exists or no close match exists.
     """
     if not nl_question or not nl_question.strip():
+        return None
+
+    # Multi-entity queries are handled post-execution to support partial success
+    if extract_entity_conjunctions(nl_question):
         return None
 
     q_lower = nl_question.strip().lower()
@@ -905,7 +1204,20 @@ Instructions:
      - Set "query_type": "select".
    - For all read-only queries, set "query_type": "select".
 
-7. Output Structure Rules:
+7. Entity Conjunctions (AND / OR) vs Attribute Filters:
+   - When a user asks for multiple distinct entities (e.g. "patient 1 and patient 2", "details of Alice Jenkins and Bob", "patient A & patient B", "patient A as well as patient B", "A, B and C", "patient 1 or patient 2"):
+     The user is requesting records for EACH independent entity.
+     CRITICAL: In SQL, a single database row CANNOT satisfy two different equality conditions on the same column at once.
+     NEVER generate a mutually exclusive condition like: WHERE name = 'Patient 1' AND name = 'Patient 2' (this returns 0 rows!).
+     ALWAYS generate: WHERE LOWER(name) IN ('patient 1', 'patient 2') OR WHERE (LOWER(name) = 'patient 1' OR LOWER(name) = 'patient 2').
+     If entities might be numeric IDs or names (e.g. 'patient 1 and patient 2'), support both: WHERE id IN (1, 2) OR LOWER(name) IN ('patient 1', 'patient 2').
+   - When user specifies OR for entities ("patient 1 or patient 2"):
+     Generate: WHERE LOWER(name) IN ('patient 1', 'patient 2') OR id IN (1, 2).
+   - Attribute / Filter conjunctions ("diabetic patients older than 60", "age > 50 and gender = female", "diabetic or hypertensive"):
+     MUST preserve standard boolean logic: WHERE diagnosis = 'diabetes' AND age > 60.
+     Do NOT confuse entity conjunctions with attribute filtering.
+
+8. Output Structure Rules:
    - If "data_available" is false:
      - "data_available": false
      - "unavailable_message": a calm informational message
@@ -989,6 +1301,8 @@ Format:
 
             try:
                 data = json.loads(cleaned)
+                if data.get("sql"):
+                    data["sql"] = fix_mutually_exclusive_and(data["sql"])
                 _validate_result(data, nl_question, filtered_schema, filtered_sample_values)
                 _enforce_language(data, detected_lang, model)
                 data["relevant_tables"] = relevant_tables
@@ -1038,6 +1352,8 @@ Output ONLY raw valid JSON without markdown formatting or backticks:
                 retry_res = model.generate_content(retry_prompt, generation_config=gen_config)
                 retry_cleaned = _clean_json_string(retry_res.text or "")
                 retry_data = json.loads(retry_cleaned)
+                if retry_data.get("sql"):
+                    retry_data["sql"] = fix_mutually_exclusive_and(retry_data["sql"])
                 _validate_result(retry_data, nl_question, filtered_schema, filtered_sample_values)
                 _enforce_language(retry_data, detected_lang, model)
                 retry_data["relevant_tables"] = relevant_tables
@@ -1055,7 +1371,47 @@ Output ONLY raw valid JSON without markdown formatting or backticks:
             last_error = exc
             continue
 
-    logger.warning("All Gemini model generation attempts failed with error: %s. Using graceful clarification fallback.", last_error)
+    logger.warning("All Gemini model generation attempts failed with error: %s. Using graceful fallback.", last_error)
+
+    # Check if this was a multi-entity query for fallback SQL generation
+    conjunction = extract_entity_conjunctions(nl_question)
+    if conjunction and filtered_schema:
+        target_table = "patients" if conjunction.get("entity_type") == "patient" else "doctors" if conjunction.get("entity_type") == "doctor" else list(filtered_schema.keys())[0]
+        if target_table in filtered_schema:
+            ids = []
+            names = []
+            for ent in conjunction.get("entities", []):
+                id_m = re.search(r"\b(\d+)\b", ent)
+                if id_m:
+                    ids.append(int(id_m.group(1)))
+                clean_name = re.sub(r"^(?:patient|doctor)\s+", "", ent, flags=re.IGNORECASE).strip()
+                if clean_name:
+                    names.append(clean_name.replace("'", "''"))
+
+            where_clauses = []
+            if ids:
+                where_clauses.append(f"id IN ({', '.join(str(i) for i in ids)})")
+            if names:
+                name_in = ", ".join(f"'{n.lower()}'" for n in names)
+                where_clauses.append(f"LOWER(name) IN ({name_in})")
+
+            where_expr = " OR ".join(where_clauses) if where_clauses else "1=1"
+            fallback_sql = f"SELECT * FROM {target_table} WHERE {where_expr};"
+            return {
+                "data_available": True,
+                "unavailable_message": None,
+                "corrected_terms": [],
+                "needs_clarification": False,
+                "clarification_question": None,
+                "interpreted_text": nl_question,
+                "query_type": "select",
+                "sql": fallback_sql,
+                "explanation": f"Retrieves records matching {', '.join(conjunction.get('entities', []))} from {target_table}.",
+                "confidence": 0.9,
+                "detected_language": detected_lang,
+                "relevant_tables": [target_table],
+            }
+
     return {
         "data_available": True,
         "unavailable_message": None,
