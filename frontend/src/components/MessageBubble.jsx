@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { motion } from 'framer-motion';
 import logoImg from '../assets/logo.png';
 
@@ -10,7 +11,7 @@ import logoImg from '../assets/logo.png';
  * 3. Clarification Question State (soft amber card prompting user for details; no SQL, no chart)
  * 4. Normal Answer State (assistant analysis card with confidence badge, optional "View SQL" drawer button, explanation, and results)
  */
-export default function MessageBubble({
+function MessageBubble({
   role = 'assistant',
   content = '',
   rawContent = '',
@@ -525,3 +526,5 @@ export default function MessageBubble({
     </motion.div>
   );
 }
+
+export default memo(MessageBubble);

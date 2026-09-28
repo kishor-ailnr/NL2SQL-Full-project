@@ -37,19 +37,18 @@ export interface AiLoadingStateProps {
   className?: string;
 }
 
-// Custom hook for live tabular elapsed timer
+// Custom hook for live tabular elapsed timer (optimized to 1s ticks to prevent UI thread lag)
 function useElapsed(enabled: boolean = true) {
-  const [ds, setDs] = useState(0);
+  const [seconds, setSeconds] = useState(0);
 
   useEffect(() => {
     if (!enabled) return;
-    const t = setInterval(() => setDs((d) => d + 1), 100);
+    const t = setInterval(() => setSeconds((s) => s + 1), 1000);
     return () => clearInterval(t);
   }, [enabled]);
 
-  const total = ds / 10;
-  if (total < 60) return `${total.toFixed(1)}s`;
-  return `${Math.floor(total / 60)}m ${(total % 60).toFixed(1)}s`;
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
 export const AiLoadingState: React.FC<AiLoadingStateProps> = ({
