@@ -4,9 +4,16 @@ import hashlib
 import json
 import logging
 import re
+import socket
 import time
 import warnings
 from typing import Dict, Any, Optional, List, Union, Tuple
+import sqlglot
+from sqlglot import exp
+
+# Set global default socket timeout so TLS handshakes / REST calls never block indefinitely
+socket.setdefaulttimeout(45.0)
+
 from app.config import GEMINI_API_KEY
 from app.services.session_store import get_session
 
@@ -26,13 +33,38 @@ if GEMINI_API_KEY and genai:
 # Prioritized list of active Gemini models (fastest and available first)
 MODELS_TO_TRY = [
     "gemini-3.1-flash-lite",
-    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
     "gemini-3.5-flash-lite",
-    "gemini-3.6-flash",
 ]
 
 # Sticky working model pointer to avoid fallback delays on every call
 _WORKING_MODEL: str = "gemini-3.1-flash-lite"
+
+# Common query command verbs that must NEVER be treated as entity search values
+COMMON_COMMAND_VERBS = {
+    "give", "show", "list", "get", "find", "tell", "fetch", "display",
+    "select", "return", "provide", "search", "check", "view", "count",
+    "filter", "print", "lookup", "query", "see", "bring", "pull", "ask"
+}
+
+# Standard stop words for isolating search terms
+QUERY_STOP_WORDS = {
+    "show", "me", "list", "get", "find", "all", "the", "of", "for", "with", "in",
+    "by", "on", "at", "to", "a", "an", "is", "are", "was", "were", "who", "whose",
+    "details", "record", "records", "search", "query", "check", "info", "information",
+    "patient", "patients", "doctor", "doctors", "customer", "customers", "order", "orders",
+    "product", "products", "appointment", "appointments", "please", "can", "you",
+    "give", "tell", "view", "see", "display", "named", "called", "name", "names", "about",
+    "age", "ages", "gender", "genders", "id", "ids", "status", "statuses", "diagnosis",
+    "from", "between", "and", "or", "not", "date", "dates", "month", "year",
+    "which", "what", "where", "how", "many", "much", "having", "than", "more", "less"
+}
+
+MONTH_NAMES = {
+    "01": "January", "02": "February", "03": "March", "04": "April",
+    "05": "May", "06": "June", "07": "July", "08": "August",
+    "09": "September", "10": "October", "11": "November", "12": "December"
+}
 
 # ---------------------------------------------------------------------------
 # In-Memory Response Caching (TTL: 10 minutes)
@@ -358,6 +390,174 @@ def detect_multi_table_ambiguity(
     return None
 
 
+def detect_conversational_intent(
+    nl_question: str,
+    schema: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Detect purely conversational messages (greetings, 'what can you do?', 'tell me a joke', 'who made you?')
+    that do not involve querying the database.
+    Returns a dict with intent='conversation', data_available=False, sql=None, and a friendly explanation with sample questions,
+    or None if the question appears to be a database query.
+    """
+    if not nl_question or not nl_question.strip():
+        return None
+
+    q_raw = nl_question.strip()
+    q_lower = q_raw.lower()
+    q_clean = re.sub(r"[^\w\s]", " ", q_lower)
+    words = q_clean.split()
+    if not words:
+        return None
+
+    # Database keywords that indicate query intent
+    db_keywords = {
+        "select", "show", "list", "find", "get", "give", "display", "fetch",
+        "how", "many", "count", "average", "avg", "sum", "total", "min", "max",
+        "minimum", "maximum", "filter", "where", "between", "top", "best", "worst",
+        "delete", "update", "insert", "drop", "alter", "records", "rows", "table",
+        "tables", "column", "columns", "database", "schema", "patient", "patients",
+        "doctor", "doctors", "appointment", "appointments", "customer", "customers",
+        "order", "orders", "product", "products", "diagnosis", "admitted", "admission",
+        "prescribe", "prescription", "salary", "age", "gender", "name", "price", "cost",
+        "revenue", "sales", "status", "bill", "billing", "department", "departments"
+    }
+
+    # If any word in query matches known schema table or column names, not pure conversation
+    if schema:
+        for tbl_name, cols in schema.items():
+            db_keywords.add(tbl_name.lower())
+            if isinstance(cols, list):
+                for col in cols:
+                    if isinstance(col, dict) and "name" in col:
+                        db_keywords.add(col["name"].lower())
+
+    # Check if any database keywords are present
+    has_db_intent = any(w in db_keywords for w in words)
+    if has_db_intent:
+        return None
+
+    # Pure conversational patterns
+    is_greeting = q_clean.strip() in {
+        "hi", "hello", "hey", "good morning", "good afternoon", "good evening",
+        "howdy", "hola", "vanakkam", "namaste", "greetings", "sup", "yo", "hi there", "hello there"
+    } or (len(words) <= 2 and words[0] in {"hi", "hello", "hey", "vanakkam", "namaste"})
+
+    is_capability = any(phrase in q_clean for phrase in [
+        "what can you do", "what do you do", "help me", "how to use", "what is this",
+        "who are you", "what are your features", "what are your capabilities", "can you help"
+    ]) or q_clean.strip() == "help"
+
+    is_chitchat = any(phrase in q_clean for phrase in [
+        "tell me a joke", "make me laugh", "say a joke", "how are you", "how are you doing",
+        "thank you", "thanks", "thanks a lot", "thank u", "bye", "goodbye", "see you", "good night"
+    ])
+
+    is_creator = any(phrase in q_clean for phrase in [
+        "who made you", "who created you", "who built you", "who developed you"
+    ])
+
+    if not (is_greeting or is_capability or is_chitchat or is_creator):
+        return None
+
+    # Formulate friendly response
+    tables = list(schema.keys()) if schema else []
+    sample_queries = []
+    if tables:
+        for t in tables[:3]:
+            sample_queries.append(f"• 'Show all {t}'")
+        sample_queries.append(f"• 'How many {tables[0]} are there?'")
+    else:
+        sample_queries = [
+            "• 'How many records are in the database?'",
+            "• 'List all tables'",
+        ]
+    samples_str = "\n".join(sample_queries)
+
+    if is_creator:
+        explanation = (
+            "I was created as an AI-powered Database Assistant to help you explore and query "
+            f"your data using natural language. Try asking questions like:\n{samples_str}"
+        )
+    elif "joke" in q_clean:
+        explanation = (
+            "Why do database administrators make great DJs? Because they always know how to drop the tables! 😄\n\n"
+            f"Whenever you're ready, feel free to ask questions about your data, such as:\n{samples_str}"
+        )
+    elif any(th in q_clean for th in ["thank", "bye", "goodbye", "good night"]):
+        explanation = "You're very welcome! Feel free to ask anytime you need data insights. Have a wonderful day!"
+    elif "how are you" in q_clean:
+        explanation = (
+            "I'm doing great, thank you! Ready to help you query and analyze your data. "
+            f"Here are a few things you can ask:\n{samples_str}"
+        )
+    else:
+        explanation = (
+            "Hello! I am your AI Database Assistant. I can help you search, summarize, and visualize data "
+            f"from your connected database using natural language. Here are some examples you can try:\n{samples_str}"
+        )
+
+    return {
+        "data_available": False,
+        "intent": "conversation",
+        "unavailable_message": None,
+        "corrected_terms": [],
+        "needs_clarification": False,
+        "clarification_question": None,
+        "interpreted_text": q_raw,
+        "query_type": "conversation",
+        "sql": None,
+        "result": [],
+        "explanation": explanation,
+        "confidence": 1.0,
+        "detected_language": detect_input_language(q_raw),
+    }
+
+
+def detect_sql_injection_attempt(nl_question: str) -> Optional[Dict[str, Any]]:
+    """Detect explicit SQL injection attempts or dangerous DDL commands in input text."""
+    if not nl_question or not isinstance(nl_question, str):
+        return None
+    q = nl_question.strip().lower()
+
+    # DDL patterns
+    if re.search(r"\bdrop\s+(?:table|database|schema)\b", q) or re.search(r"\btruncate\s+(?:table)?\b", q):
+        return {
+            "data_available": True,
+            "needs_clarification": False,
+            "clarification_question": None,
+            "sql": None,
+            "explanation": "Schema modification or destructive operations (such as DROP TABLE or DROP DATABASE) are strictly prohibited.",
+            "confidence": 0.0,
+            "query_type": "select",
+            "result": [],
+            "interpreted_text": nl_question,
+            "detected_language": "english",
+        }
+
+    # Tautology injection patterns e.g. ' OR 1=1, ' OR '1'='1, 1=1;
+    if (
+        re.search(r"(?:'|\")\s*or\s+['\"]?1['\"]?\s*=\s*['\"]?1", q)
+        or re.search(r"\b1\s*=\s*1\s*;", q)
+        or re.search(r";\s*drop\b", q)
+        or re.search(r"where\s+1\s*=\s*1\s*;", q)
+        or re.search(r"or\s+1\s*=\s*1\s*--", q)
+    ):
+        return {
+            "data_available": True,
+            "needs_clarification": False,
+            "clarification_question": None,
+            "sql": None,
+            "explanation": "Potential SQL injection attack pattern detected and blocked for database security.",
+            "confidence": 0.0,
+            "query_type": "select",
+            "result": [],
+            "interpreted_text": nl_question,
+            "detected_language": "english",
+        }
+
+    return None
+
+
 def find_table_for_value(
     value: str,
     sample_values_map: Optional[Dict[str, Any]],
@@ -392,13 +592,14 @@ def find_table_for_value(
 # ---------------------------------------------------------------------------
 
 ATTRIBUTE_FILTER_KEYWORDS = {
-    "age", "gender", "male", "female", "older", "younger", "above", "below",
+    "age", "ages", "name", "names", "gender", "male", "female", "older", "younger", "above", "below",
     "greater", "less", "more", "between", "diagnosis", "disease", "condition",
     "diabetic", "diabetes", "hypertensive", "hypertension", "fever", "cancer",
-    "admitted", "admission", "date", "status", "scheduled", "completed", "cancelled",
+    "admitted", "admission", "date", "dates", "status", "scheduled", "completed", "cancelled",
     "count", "average", "avg", "sum", "total", "top", "limit", "min", "max",
     "department", "salary", "price", "cost", "bill", "billing", "paid", "unpaid",
-    "amount", "years", "year", "months", "month", "days", "day"
+    "amount", "years", "year", "months", "month", "days", "day",
+    "column", "columns", "field", "fields", "email", "city", "specialty", "phone"
 }
 
 DISCARD_WORDS = {
@@ -440,6 +641,10 @@ def extract_entity_conjunctions(nl_question: str) -> Optional[Dict[str, Any]]:
 
     # Reject queries with explicit comparison operators (attribute filters like age > 50)
     if re.search(r"[><=]|>=|<=", q):
+        return None
+
+    # Reject queries asking for all entities (e.g. "all patients", "all doctors", "all customers")
+    if re.search(r"\b(?:all|every)\s+(?:patients?|doctors?|customers?|products?|records?|rows?)\b", q_lower):
         return None
 
     # Reject aggregation queries (e.g. "count of patients and count of doctors")
@@ -502,25 +707,303 @@ def extract_entity_conjunctions(nl_question: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def fix_mutually_exclusive_and(sql: str) -> str:
-    """Detect and convert mutually exclusive AND conditions on the same column to OR.
+def get_and_conjuncts(node):
+    """Recursively extract all conjuncts in an AND tree."""
+    if node is None:
+        return []
+    if isinstance(node, exp.Paren):
+        return get_and_conjuncts(node.this)
+    if isinstance(node, exp.And):
+        return get_and_conjuncts(node.this) + get_and_conjuncts(node.expression)
+    return [node]
 
-    e.g. WHERE name = 'Alice' AND name = 'Bob' -> WHERE name = 'Alice' OR name = 'Bob'
-    e.g. WHERE LOWER(name) = 'alice' AND LOWER(name) = 'bob' -> WHERE LOWER(name) = 'alice' OR LOWER(name) = 'bob'
-    e.g. WHERE id = 1 AND id = 2 -> WHERE id = 1 OR id = 2
-    Preserves range conditions (e.g. age > 20 AND age < 50) and cross-column filters (diagnosis = 'X' AND age > 60).
+
+def build_and_tree(conjuncts):
+    """Rebuild an AND tree from a list of conjuncts."""
+    if not conjuncts:
+        return None
+    res = conjuncts[0]
+    for c in conjuncts[1:]:
+        res = exp.And(this=res, expression=c)
+    return res
+
+
+def extract_col_and_literal(pred):
+    """If pred is col = literal (or literal = col), return (col_expr, norm_col_key, literal_expr).
+    Handles LOWER(col), table.col, quoted identifiers.
     """
-    if not sql or " AND " not in sql.upper():
+    if not isinstance(pred, exp.EQ):
+        return None
+    left, right = pred.this, pred.expression
+
+    col_expr = None
+    lit_expr = None
+
+    if isinstance(right, exp.Literal):
+        lit_expr = right
+        col_expr = left
+    elif isinstance(left, exp.Literal):
+        lit_expr = left
+        col_expr = right
+    else:
+        return None
+
+    # Check if col_expr is a Column, or Lower(Column), or similar deterministic expression
+    is_valid_col = False
+    if isinstance(col_expr, exp.Column):
+        is_valid_col = True
+    elif isinstance(col_expr, exp.Lower) and isinstance(col_expr.this, exp.Column):
+        is_valid_col = True
+
+    if not is_valid_col:
+        return None
+
+    norm_col_key = col_expr.sql(dialect="sqlite").lower()
+    return col_expr, norm_col_key, lit_expr
+
+
+def rewrite_and_group(node, notes_list):
+    """Walk an AND group and rewrite multiple equality predicates on the same column into an IN condition."""
+    conjuncts = get_and_conjuncts(node)
+    if len(conjuncts) < 2:
+        return node
+
+    col_preds = {}
+    for idx, c in enumerate(conjuncts):
+        info = extract_col_and_literal(c)
+        if info:
+            col_expr, norm_key, lit_expr = info
+            col_preds.setdefault(norm_key, []).append((idx, col_expr, lit_expr))
+
+    rewritten_indices = set()
+    new_in_predicates = []
+
+    for norm_key, pred_list in col_preds.items():
+        if len(pred_list) >= 2:
+            lit_sql_set = {lit.sql(dialect="sqlite") for _, _, lit in pred_list}
+            if len(lit_sql_set) >= 2:
+                # Unsatisfiable col = a AND col = b condition found!
+                first_col_expr = pred_list[0][1]
+                unique_lits = []
+                seen_lits = set()
+                for _, _, lit in pred_list:
+                    l_sql = lit.sql(dialect="sqlite")
+                    if l_sql not in seen_lits:
+                        seen_lits.add(l_sql)
+                        unique_lits.append(lit)
+
+                in_node = exp.In(this=first_col_expr.copy(), expressions=[l.copy() for l in unique_lits])
+                new_in_predicates.append(in_node)
+                for idx, _, _ in pred_list:
+                    rewritten_indices.add(idx)
+
+                val_reprs = " and ".join(str(l.this) for l in unique_lits)
+                notes_list.append(f"Treated '{val_reprs}' as either value")
+
+    if not rewritten_indices:
+        return node
+
+    remaining = [c for idx, c in enumerate(conjuncts) if idx not in rewritten_indices]
+    combined = remaining + new_in_predicates
+    return build_and_tree(combined)
+
+
+def sanitize_mutually_exclusive_and(sql: str, explanation: Optional[str] = None) -> Tuple[str, Optional[str]]:
+    """Deterministic AST guard using sqlglot to walk all WHERE, JOIN ON, subqueries,
+    and nested OR/AND groups.
+    If the SAME column has 2+ equality predicates against DIFFERENT literals inside one AND group,
+    that condition is unsatisfiable. Rewrites them to col IN (v1, v2, ...) and adds a note
+    to the explanation ('Treated 'X and Y' as either value').
+    Preserves satisfiable conditions: col > 5 AND col < 10, LIKE '%a%' AND LIKE '%b%',
+    different columns, intersection queries with GROUP BY/HAVING.
+    """
+    if not sql or (" AND " not in sql.upper() and " and " not in sql):
+        return sql, explanation
+
+    try:
+        tree = sqlglot.parse_one(sql, read="sqlite")
+    except Exception:
+        # Graceful fallback to regex if sqlglot parse fails on unconventional syntax
+        return _regex_fallback_mutually_exclusive_and(sql, explanation)
+
+    notes = []
+
+    def transform_clause(clause_node):
+        if not clause_node:
+            return clause_node
+        def visitor(node):
+            if isinstance(node, exp.And):
+                return rewrite_and_group(node, notes)
+            return node
+        return clause_node.transform(visitor)
+
+    for select in tree.find_all(exp.Select):
+        if select.args.get("where"):
+            select.args["where"].set("this", transform_clause(select.args["where"].this))
+        for join in select.args.get("joins") or []:
+            if join.args.get("on"):
+                join.args["on"] = transform_clause(join.args["on"])
+
+    rewritten_sql = tree.sql(dialect="sqlite")
+
+    # Update explanation if any note was generated
+    updated_explanation = explanation
+    if notes:
+        unique_notes = []
+        for n in notes:
+            if n not in unique_notes:
+                unique_notes.append(n)
+        notes_str = "; ".join(unique_notes)
+        if updated_explanation:
+            if notes_str not in updated_explanation:
+                updated_explanation = f"{updated_explanation.rstrip('.')} ({notes_str})."
+        else:
+            updated_explanation = f"Query executed successfully ({notes_str})."
+
+    return rewritten_sql, updated_explanation
+
+
+def _regex_fallback_mutually_exclusive_and(sql: str, explanation: Optional[str] = None) -> Tuple[str, Optional[str]]:
+    pattern = r"((?:LOWER\s*\(\s*)?(\w+)(?:\s*\))?\s*=\s*(?:'[^']*'|\d+))\s+AND\s+((?:LOWER\s*\(\s*)?\2(?:\s*\))?\s*=\s*(?:'[^']*'|\d+))"
+    current = sql
+    changed = False
+    for _ in range(5):
+        new_sql = re.sub(pattern, r"\1 OR \3", current, flags=re.IGNORECASE)
+        if new_sql != current:
+            changed = True
+            current = new_sql
+        else:
+            break
+    exp_out = explanation
+    if changed:
+        note = "Treated values as either value"
+        if exp_out:
+            if note not in exp_out:
+                exp_out = f"{exp_out.rstrip('.')} ({note})."
+        else:
+            exp_out = f"Query executed successfully ({note})."
+    return current, exp_out
+
+
+def fix_mutually_exclusive_and(sql: str) -> str:
+    """Detect and rewrite mutually exclusive AND conditions on the same column into OR.
+    
+    Preserved for backward-compatibility with existing tests.
+    """
+    if not sql or " AND " not in sql:
         return sql
 
     pattern = r"((?:LOWER\s*\(\s*)?(\w+)(?:\s*\))?\s*=\s*(?:'[^']*'|\d+))\s+AND\s+((?:LOWER\s*\(\s*)?\2(?:\s*\))?\s*=\s*(?:'[^']*'|\d+))"
+    
     current = sql
     for _ in range(5):
         new_sql = re.sub(pattern, r"\1 OR \3", current, flags=re.IGNORECASE)
-        if new_sql == current:
+        if new_sql != current:
+            current = new_sql
+        else:
             break
-        current = new_sql
+            
     return current
+
+
+def extract_where_filter_values(sql: str) -> List[Tuple[str, List[Any]]]:
+    """Parse SQL and extract target column and literal values from WHERE clause."""
+    try:
+        tree = sqlglot.parse_one(sql, read="sqlite")
+    except Exception:
+        return []
+
+    where = tree.find(exp.Where)
+    if not where:
+        return []
+
+    results = []
+    # 1. In expressions: col IN (val1, val2, ...)
+    for in_expr in where.find_all(exp.In):
+        col = in_expr.this
+        col_name = col.sql(dialect="sqlite")
+        vals = [e.this if isinstance(e, exp.Literal) else e.sql(dialect="sqlite") for e in (in_expr.expressions or [])]
+        results.append((col_name, vals))
+
+    # 2. Equality expressions inside OR / AND
+    if not results:
+        eq_map = {}
+        for eq in where.find_all(exp.EQ):
+            left, right = eq.this, eq.expression
+            col, lit = None, None
+            if isinstance(right, exp.Literal):
+                lit = right.this
+                col = left
+            elif isinstance(left, exp.Literal):
+                lit = left.this
+                col = right
+            if col and lit is not None:
+                col_name = col.sql(dialect="sqlite")
+                eq_map.setdefault(col_name, []).append(lit)
+        for col_name, vals in eq_map.items():
+            results.append((col_name, vals))
+
+    return results
+
+
+def evaluate_where_clause_results(
+    sql: str,
+    exec_result: List[Dict[str, Any]],
+    question: str,
+) -> Optional[str]:
+    """Inspect the executed SQL WHERE clause to check multi-value satisfaction.
+    If some requested values were found and others were not, return an explanation like:
+    'Found transaction TXN_1001; no transaction TXN_1002 found.'
+    """
+    if not sql or not exec_result:
+        return None
+
+    filter_info = extract_where_filter_values(sql)
+    if not filter_info:
+        return None
+
+    for col_expr, requested_vals in filter_info:
+        if len(requested_vals) >= 2:
+            col_clean = re.sub(r"^(?:LOWER|UPPER|TRIM)\s*\(\s*", "", col_expr, flags=re.IGNORECASE).rstrip(")")
+            col_base = col_clean.split(".")[-1].strip('"`[] ')
+            clean_req = [str(v).strip("'\"") for v in requested_vals]
+            found = []
+            missing = []
+
+            for target in clean_req:
+                target_l = target.lower()
+                is_found = False
+                for row in exec_result:
+                    if col_base in row and str(row[col_base]).lower() == target_l:
+                        is_found = True
+                        break
+                    for k, val in row.items():
+                        if str(val).lower() == target_l:
+                            is_found = True
+                            break
+                    if is_found:
+                        break
+                if is_found:
+                    found.append(target)
+                else:
+                    missing.append(target)
+
+            if found and missing:
+                entity_label = col_base.replace("_", " ").replace(" id", "").strip()
+                if not entity_label or entity_label in ("id", "name"):
+                    q_l = question.lower()
+                    for candidate in ("transaction", "customer", "product", "order", "patient", "doctor", "item"):
+                        if candidate in q_l:
+                            entity_label = candidate
+                            break
+                    if not entity_label or entity_label in ("id", "name"):
+                        entity_label = "record"
+
+                found_str = ", ".join(found)
+                missing_str = ", ".join(missing)
+                return f"Found {entity_label} {found_str}; no {entity_label} {missing_str} found."
+
+    return None
 
 
 def match_entity_to_rows(entity: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -698,12 +1181,13 @@ def find_near_miss_value(
 
     q_lower = nl_question.strip().lower()
 
-    # Do not check near-miss for obvious criteria / aggregations / temporal filters
+    # Do not check near-miss for obvious criteria / aggregations / temporal filters / pattern searches
     criteria_keywords = {
         "day", "days", "month", "months", "year", "years", "week", "weeks",
         "older", "younger", "greater", "less", "more", "between", "visited",
         "admitted", "how many", "count", "average", "avg", "sum", "total",
-        "highest", "lowest", "most", "least", "top"
+        "highest", "lowest", "most", "least", "top", "contains", "containing",
+        "starts", "starting", "ends", "ending", "like"
     }
     q_words_set = set(re.findall(r"\b[a-zA-Z0-9_]+\b", q_lower))
     if q_words_set.intersection(criteria_keywords):
@@ -739,20 +1223,23 @@ def find_near_miss_value(
             unique_samples.append((s_val, is_name))
 
     # Clean question to isolate candidate search phrase
-    stop_words = {
-        "show", "me", "list", "get", "find", "all", "the", "of", "for", "with", "in",
-        "by", "on", "at", "to", "a", "an", "is", "are", "was", "were", "who", "whose",
-        "details", "record", "records", "search", "query", "check", "info", "information",
-        "patient", "patients", "doctor", "doctors", "customer", "customers", "order", "orders",
-        "product", "products", "appointment", "appointments", "please", "can", "you",
-        "give", "tell", "view", "see", "display", "named", "called", "name", "about"
-    }
+    stop_words = QUERY_STOP_WORDS
 
     prefix_pattern = r"^(?:show|list|get|find|search\s+for|view|display|details\s+of)\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?(?:patients?|doctors?|customers?|products?|records?|details?|info)?\s*(?:of\s+)?(?:patients?|doctors?|customers?|products?|records?|details?|info)?\s*(?:named|called|for|with)?\s*"
     candidate_phrase = re.sub(prefix_pattern, "", nl_question.strip(), flags=re.IGNORECASE).strip()
-    candidate_phrase = re.sub(r"[^\w\s]", "", candidate_phrase).strip()
+    schema_cols = set()
+    if schema:
+        for tbl, cols in schema.items():
+            if isinstance(cols, list):
+                for c in cols:
+                    c_name = c.get("name", "") if isinstance(c, dict) else str(c)
+                    schema_cols.add(c_name.lower())
+                    schema_cols.add(c_name.lower() + "s")
 
-    candidate_tokens = [w for w in re.findall(r"\b[a-zA-Z0-9_]+\b", nl_question) if w.lower() not in stop_words and len(w) >= 3]
+    candidate_tokens = [
+        w for w in re.findall(r"\b[a-zA-Z0-9_]+\b", nl_question)
+        if w.lower() not in stop_words and w.lower() not in schema_cols and len(w) >= 3
+    ]
 
     # Check for exact matches first: if exact match exists anywhere in question or candidate phrase, no confirmation needed
     q_norm = " " + re.sub(r"[^\w\s]", " ", nl_question.lower()) + " "
@@ -762,6 +1249,13 @@ def find_near_miss_value(
         s_clean = re.sub(r"\s+", " ", s_clean)
         if s_clean in q_norm:
             return None
+
+        core_val = get_core_person_name(s_val)
+        if core_val and len(core_val) >= 3:
+            core_clean = " " + re.sub(r"[^\w\s]", " ", core_val.lower()) + " "
+            core_clean = re.sub(r"\s+", " ", core_clean)
+            if core_clean in q_norm:
+                return None
 
         s_clean_val = re.sub(r"[^\w\s]", "", s_val.lower()).strip()
         if candidate_phrase.lower() == s_clean_val:
@@ -788,26 +1282,32 @@ def find_near_miss_value(
             s_lower = s_val.lower()
             s_words = [w.lower() for w in s_val.split()]
 
-            # 1. Exact single-word match in a multi-word sample (e.g. 'harini' matches 'Harini' in 'Harini Krishnan')
-            if term_lower in s_words and len(s_words) > 1:
+            # 1. Exact single-word match in a multi-word sample (only for person names, e.g. 'harini' -> 'Harini Krishnan')
+            if term_lower in s_words:
+                if is_name and len(s_words) > 1:
+                    return (term, s_val)
+                # Exact word match for attributes (e.g. 'diabetes') is a valid query, not a typo
+                continue
+
+            # 2. Substring match for person names (e.g. 'harini' in 'Harini Krishnan')
+            if is_name and len(term_lower) >= 4 and term_lower in s_lower:
                 return (term, s_val)
 
-            # 2. Substring match for names (e.g. 'harini' in 'Harini Krishnan')
-            if len(term_lower) >= 4 and term_lower in s_lower:
-                return (term, s_val)
-
-            # 3. Fuzzy similarity against individual words in the sample value
+            # 3. Fuzzy similarity against individual words in the sample value (0.75 <= sim < 1.0)
             for w in s_words:
+                if term_lower == w:
+                    continue
                 sim = difflib.SequenceMatcher(None, term_lower, w).ratio()
-                if sim >= 0.75 and sim > best_score:
+                if 0.75 <= sim < 1.0 and sim > best_score:
                     best_score = sim
                     best_match = s_val
 
-            # 4. Fuzzy similarity against full sample value
-            full_sim = difflib.SequenceMatcher(None, term_lower, s_lower).ratio()
-            if full_sim >= 0.75 and full_sim > best_score:
-                best_score = full_sim
-                best_match = s_val
+            # 4. Fuzzy similarity against full sample value (0.75 <= sim < 1.0)
+            if term_lower != s_lower:
+                full_sim = difflib.SequenceMatcher(None, term_lower, s_lower).ratio()
+                if 0.75 <= full_sim < 1.0 and full_sim > best_score:
+                    best_score = full_sim
+                    best_match = s_val
 
         if best_match and best_score >= 0.75:
             return (term, best_match)
@@ -892,7 +1392,8 @@ def generate_sql(
                 "needs_clarification": False,
                 "clarification_question": None,
                 "interpreted_text": nl_question,
-                "query_type": "select",
+                "query_type": "conversation",
+                "intent": "conversation",
                 "sql": None,
                 "result": [],
                 "explanation": "Understood. Please let me know what you would like to search for instead.",
@@ -975,6 +1476,20 @@ def generate_sql(
                     "relevant_tables": ["doctors"],
                 }
 
+
+    # ---------------------------------------------------------------------------
+    # Security check: detect injection attempts and schema destructive commands
+    # ---------------------------------------------------------------------------
+    injection_resp = detect_sql_injection_attempt(nl_question)
+    if injection_resp:
+        return injection_resp
+
+    # ---------------------------------------------------------------------------
+    # Conversational intent check: greetings, capabilities, chitchat (no DB query)
+    # ---------------------------------------------------------------------------
+    conv_intent = detect_conversational_intent(nl_question, session.get("schema", {}))
+    if conv_intent:
+        return conv_intent
 
     # ---------------------------------------------------------------------------
     # Response Caching: key = SHA256(schema_sig + normalized_question + language + context)
@@ -1128,7 +1643,11 @@ def generate_sql(
 5. Conversational Follow-Up Context:
    - Previous question: "{prev_q}"
    - Previous generated SQL: "{prev_sql}"
-   - If the current user question is a follow-up or refinement (e.g., "what about last month?", "only for females", "by product"), interpret it in the context of the previous query and build upon or adjust the previous SQL logic.
+   - If the current user question is a follow-up, refinement, or pivot:
+     - Interpret it directly in the context of the previous query and generate the SQL. DO NOT ask for clarification if the follow-up can refine or pivot the previous query!
+     - Filtering refinements (e.g. previous was "Show all doctors" and current is "in Cardiology"): refine the previous query: SELECT * FROM doctors WHERE LOWER(specialty) = 'cardiology';
+     - Entity pivots (e.g. previous was "Count patients" and current is "what about doctors?"): apply the same aggregate to the new entity: SELECT COUNT(*) FROM doctors;
+     - Set "needs_clarification": false, generate valid SQLite in "sql", provide a clear "explanation", confidence >= 0.85.
 """
 
     base_prompt = f"""You are an expert SQLite SQL engineer and database analyst.
@@ -1204,20 +1723,53 @@ Instructions:
      - Set "query_type": "select".
    - For all read-only queries, set "query_type": "select".
 
-7. Entity Conjunctions (AND / OR) vs Attribute Filters:
-   - When a user asks for multiple distinct entities (e.g. "patient 1 and patient 2", "details of Alice Jenkins and Bob", "patient A & patient B", "patient A as well as patient B", "A, B and C", "patient 1 or patient 2"):
-     The user is requesting records for EACH independent entity.
-     CRITICAL: In SQL, a single database row CANNOT satisfy two different equality conditions on the same column at once.
-     NEVER generate a mutually exclusive condition like: WHERE name = 'Patient 1' AND name = 'Patient 2' (this returns 0 rows!).
-     ALWAYS generate: WHERE LOWER(name) IN ('patient 1', 'patient 2') OR WHERE (LOWER(name) = 'patient 1' OR LOWER(name) = 'patient 2').
-     If entities might be numeric IDs or names (e.g. 'patient 1 and patient 2'), support both: WHERE id IN (1, 2) OR LOWER(name) IN ('patient 1', 'patient 2').
-   - When user specifies OR for entities ("patient 1 or patient 2"):
-     Generate: WHERE LOWER(name) IN ('patient 1', 'patient 2') OR id IN (1, 2).
-   - Attribute / Filter conjunctions ("diabetic patients older than 60", "age > 50 and gender = female", "diabetic or hypertensive"):
-     MUST preserve standard boolean logic: WHERE diagnosis = 'diabetes' AND age > 60.
-     Do NOT confuse entity conjunctions with attribute filtering.
+7. Multi-Value Filtering and Conjunction Rules (STRICT LOGIC):
+   a. SAME-COLUMN MULTI-VALUE UNION (CRITICAL):
+      - Two or more values for the SAME column joined by "and", "or", "&", a comma, "with", or Tamil/Thanglish equivalents ("matrum", "mattum", "um", "mathiri", "kooda") mean a UNION of values:
+        Use: col IN (...) or (col = v1 OR col = v2).
+        NEVER generate: col = v1 AND col = v2 (impossible: a single database row cannot have two distinct values in the same column, and will return 0 rows!).
+      - This rule applies universally across ANY column type: numeric IDs, text IDs/codes, names, dates, amounts, categories, or statuses.
+      - Support any number of values (from 2 up to 50 values) and mixed comma-and forms in one question (e.g., "ids 1, 2 and 5", "names Ravi, Priya and Amit").
+      - If entities might be numeric IDs or names (e.g. 'customer 1 and customer 2'), support both: WHERE id IN (1, 2) OR LOWER(name) IN ('customer 1', 'customer 2').
+   b. CONDITIONS ON DIFFERENT COLUMNS (LOGICAL AND):
+      - Conditions on DIFFERENT columns joined by "and" mean logical AND (e.g., "customers in Chennai and age above 30" -> WHERE city = 'Chennai' AND age > 30).
+      - Mixed questions combining same-column choices and different-column criteria must group properly with parentheses:
+        e.g., "customer 1 or 2 and city Chennai" -> WHERE id IN (1, 2) AND city = 'Chennai'.
+   c. SET INTERSECTION OVER MULTIPLE ROWS:
+      - Phrasings like "both X and Y" or "customers who bought product A and product B" represent a set INTERSECTION across multiple rows.
+      - Use aggregation with GROUP BY and HAVING COUNT(DISTINCT ...) or INTERSECT:
+        e.g., SELECT customer_id FROM orders WHERE product_id IN ('A', 'B') GROUP BY customer_id HAVING COUNT(DISTINCT product_id) = 2;
+        or ask a short clarification if ambiguous.
+   d. NEGATION, EXCLUSIONS, AND RANGES:
+      - "not X", "except X", "other than X" (e.g., "everyone except customer 1 and 2") mean NOT IN / !=:
+        e.g., WHERE id NOT IN (1, 2).
+      - "between A and B" or "from A to B" represents a continuous numerical or date range (e.g. amount BETWEEN 100 AND 250, or col >= 100 AND col <= 250).
+        The "and" inside a BETWEEN clause connects range bounds and MUST NEVER be split or transformed into an IN list.
+   e. TEXT VALUES & DATA INTEGRITY:
+      - Use case-insensitive matching for text comparisons: LOWER(col) IN ('a', 'b') or (LOWER(col) = 'a' OR LOWER(col) = 'b').
+      - Maintain the strict literal data value rule: retain the exact text literal values typed by the user.
 
-8. Output Structure Rules:
+8. Date & Time Filtering Rules:
+   - Several distinct dates mean IN or OR on the date column:
+     e.g., "orders on 2024-02-01 and 2024-02-03" -> WHERE order_date IN ('2024-02-01', '2024-02-03').
+   - "from A to B" and "between A and B" mean a continuous range:
+     e.g., appointment_date BETWEEN '2024-02-01' AND '2024-02-05'.
+   - When the user asks for records by month or date range WITHOUT specifying a year (e.g., "appointment date between January and February", "orders in March", "January and February"):
+     - Do NOT assume the current year or any specific year.
+     - You MUST match by month across ALL years using SQLite strftime('%m', date_column):
+       e.g., strftime('%m', appointment_date) BETWEEN '01' AND '02'
+       e.g., strftime('%m', order_date) IN ('01', '02')
+       (Two-digit month numbers: '01'=Jan, '02'=Feb, '03'=Mar, ..., '12'=Dec).
+     - In the "explanation" field, you MUST explicitly state: "no year given, so all years were included".
+   - When the user specifies an explicit year (e.g. "January 2024", "between Jan and Feb 2024", "in 2024"):
+     - Filter on that specific year:
+       e.g., appointment_date BETWEEN '2024-01-01' AND '2024-02-29'
+       or strftime('%Y', appointment_date) = '2024' AND strftime('%m', appointment_date) BETWEEN '01' AND '02'.
+   - For relative date terms:
+     - "last 30 days": date_column >= date('now', '-30 days')
+     - "this year": strftime('%Y', date_column) = strftime('%Y', 'now')
+
+9. Output Structure Rules:
    - If "data_available" is false:
      - "data_available": false
      - "unavailable_message": a calm informational message
@@ -1294,7 +1846,6 @@ Format:
             response = model.generate_content(
                 base_prompt,
                 generation_config=gen_config,
-                request_options={"timeout": 30.0},
             )
             raw_text = response.text or ""
             cleaned = _clean_json_string(raw_text)
@@ -1302,7 +1853,7 @@ Format:
             try:
                 data = json.loads(cleaned)
                 if data.get("sql"):
-                    data["sql"] = fix_mutually_exclusive_and(data["sql"])
+                    data["sql"], data["explanation"] = sanitize_mutually_exclusive_and(data["sql"], data.get("explanation"))
                 _validate_result(data, nl_question, filtered_schema, filtered_sample_values)
                 _enforce_language(data, detected_lang, model)
                 data["relevant_tables"] = relevant_tables
@@ -1326,6 +1877,7 @@ Instructions:
 3. Fix speech-to-text mistakes in interpreted_text and list {{"original", "corrected"}} pairs in corrected_terms ONLY for schema keywords or SQL terms. NEVER substitute person names or data values (e.g. searching 'virthi' must use literal 'virthi' in WHERE clause, never 'Karthik').
 4. If needs_clarification is true, set sql to null, explanation to null, confidence < 0.5, and provide a short clarification_question.
 5. If valid and available, generate valid SQLite in sql, explanation, confidence >= 0.5.
+6. Same-column multi-value rule: Two or more values for the SAME column joined by 'and', 'or', commas mean col IN (...) or OR. Never col = a AND col = b. Different columns use AND. Ranges use BETWEEN.
 
 User Question to Answer:
 "{nl_question}"
@@ -1353,7 +1905,7 @@ Output ONLY raw valid JSON without markdown formatting or backticks:
                 retry_cleaned = _clean_json_string(retry_res.text or "")
                 retry_data = json.loads(retry_cleaned)
                 if retry_data.get("sql"):
-                    retry_data["sql"] = fix_mutually_exclusive_and(retry_data["sql"])
+                    retry_data["sql"], retry_data["explanation"] = sanitize_mutually_exclusive_and(retry_data["sql"], retry_data.get("explanation"))
                 _validate_result(retry_data, nl_question, filtered_schema, filtered_sample_values)
                 _enforce_language(retry_data, detected_lang, model)
                 retry_data["relevant_tables"] = relevant_tables
@@ -1563,20 +2115,35 @@ def _validate_result(
 
     data["data_available"] = data_available
     if not data_available:
-        unavail_msg = data.get("unavailable_message")
-        if not unavail_msg or not isinstance(unavail_msg, str) or not unavail_msg.strip():
-            data["unavailable_message"] = "This information is not tracked in the connected database schema."
+        if data.get("intent") == "conversation" or data.get("query_type") == "conversation":
+            data["sql"] = None
+            data["needs_clarification"] = False
+            data["clarification_question"] = None
+            data["unavailable_message"] = None
+            data["intent"] = "conversation"
+            data["query_type"] = "conversation"
+            if not data.get("explanation"):
+                data["explanation"] = "Hello! I am your AI Database Assistant. How can I help you query your database?"
+            try:
+                conf = float(data.get("confidence", 1.0))
+                data["confidence"] = conf
+            except (ValueError, TypeError):
+                data["confidence"] = 1.0
         else:
-            data["unavailable_message"] = unavail_msg.strip()
-        data["sql"] = None
-        data["explanation"] = None
-        data["needs_clarification"] = False
-        data["clarification_question"] = None
-        try:
-            conf = float(data.get("confidence", 0.85))
-            data["confidence"] = conf
-        except (ValueError, TypeError):
-            data["confidence"] = 0.85
+            unavail_msg = data.get("unavailable_message")
+            if not unavail_msg or not isinstance(unavail_msg, str) or not unavail_msg.strip():
+                data["unavailable_message"] = "This information is not tracked in the connected database schema."
+            else:
+                data["unavailable_message"] = unavail_msg.strip()
+            data["sql"] = None
+            data["explanation"] = None
+            data["needs_clarification"] = False
+            data["clarification_question"] = None
+            try:
+                conf = float(data.get("confidence", 0.85))
+                data["confidence"] = conf
+            except (ValueError, TypeError):
+                data["confidence"] = 0.85
     else:
         data["unavailable_message"] = None
 
@@ -1639,36 +2206,47 @@ def _validate_result(
         if data.get("explanation"):
             data["explanation"] = re.sub(rf"\b{re.escape(corr)}\b", orig, data["explanation"], flags=re.IGNORECASE)
 
-    # Additional safety net: Check if SQL WHERE clause contains a sample data value not present in user query
+    # Additional safety net: Check if SQL WHERE clause substituted an entity name search value
+    # (e.g. user asked for 'virthi', but SQL substituted 'Karthik')
     if data.get("sql") and nl_question:
         sql_str = data["sql"]
-        stop_words = {
-            "show", "me", "list", "get", "find", "all", "the", "of", "for", "with", "in",
-            "by", "on", "at", "to", "a", "an", "is", "are", "was", "were", "who", "whose",
-            "details", "record", "records", "search", "query", "check", "info", "information"
-        }
-        q_non_schema_words = [
-            w for w in re.findall(r"\b[a-zA-Z0-9_]+\b", nl_question)
-            if w.lower() not in stop_words and not _is_schema_term(w)
+        q_tokens = re.findall(r"\b[a-zA-Z0-9_']+\b", nl_question)
+        candidate_user_terms = [
+            w for w in q_tokens
+            if w.lower() not in QUERY_STOP_WORDS
+            and w.lower() not in COMMON_COMMAND_VERBS
+            and not _is_schema_term(w)
+            and not w.isdigit()
+            and len(w) >= 3
         ]
         sql_literals = re.findall(r"['\"]%?([^%'\"]+)%?['\"]", sql_str)
         for lit in sql_literals:
             lit_lower = lit.lower()
+            # NEVER touch dates, month strings, numbers, booleans, or common status/gender values
+            if (
+                re.match(r"^\d{4}", lit)
+                or re.match(r"^\d{1,2}$", lit)
+                or lit_lower in ("completed", "scheduled", "cancelled", "active", "male", "female", "yes", "no", "true", "false")
+            ):
+                continue
             if _is_data_value(lit_lower) and not _is_schema_term(lit_lower):
                 if lit_lower not in nl_question.lower():
-                    # Sample data value was used in SQL without appearing in user question
-                    for qw in q_non_schema_words:
-                        if qw.lower() not in sql_str.lower():
-                            logger.warning(
-                                "[Safety Net] Silent data substitution detected: '%s' in SQL replaced user term '%s'. Reverting SQL to user literal.",
-                                lit, qw
-                            )
-                            data["sql"] = data["sql"].replace(lit, qw)
-                            if data.get("interpreted_text"):
-                                data["interpreted_text"] = re.sub(rf"\b{re.escape(lit)}\b", qw, data["interpreted_text"], flags=re.IGNORECASE)
-                            if data.get("explanation"):
-                                data["explanation"] = re.sub(rf"\b{re.escape(lit)}\b", qw, data["explanation"], flags=re.IGNORECASE)
-                            break
+                    for qw in candidate_user_terms:
+                        qw_lower = qw.lower()
+                        if qw_lower not in sql_str.lower():
+                            ratio = difflib.SequenceMatcher(None, qw_lower, lit_lower).ratio()
+                            is_entity_target = bool(re.search(rf"\b(?:patient|doctor|customer|product|named|name)\s+{re.escape(qw)}\b", nl_question, re.IGNORECASE))
+                            if ratio >= 0.45 or is_entity_target:
+                                logger.warning(
+                                    "[Safety Net] Silent name substitution detected: '%s' in SQL replaced user term '%s'. Reverting SQL to user literal.",
+                                    lit, qw
+                                )
+                                data["sql"] = data["sql"].replace(lit, qw)
+                                if data.get("interpreted_text"):
+                                    data["interpreted_text"] = re.sub(rf"\b{re.escape(lit)}\b", qw, data["interpreted_text"], flags=re.IGNORECASE)
+                                if data.get("explanation"):
+                                    data["explanation"] = re.sub(rf"\b{re.escape(lit)}\b", qw, data["explanation"], flags=re.IGNORECASE)
+                                break
 
     if not data_available:
         return
@@ -1705,12 +2283,28 @@ def _validate_result(
     else:
         data["clarification_question"] = None
         sql = data.get("sql")
+        explanation = (data.get("explanation") or "").strip()
+        is_blocked = (
+            "prohibit" in explanation.lower()
+            or "forbidden" in explanation.lower()
+            or "not allowed" in explanation.lower()
+            or "blocked" in explanation.lower()
+            or "destructive" in explanation.lower()
+            or any(k in nl_question.lower() for k in ("drop table", "drop database", "truncate table", "delete all", "update all"))
+        )
+
         if not sql or not isinstance(sql, str) or not sql.strip():
-            explanation = (data.get("explanation") or "").strip()
-            data["needs_clarification"] = True
-            data["clarification_question"] = explanation or "Could you please clarify your request?"
-            data["sql"] = None
-            data["confidence"] = 0.3
+            if is_blocked:
+                data["needs_clarification"] = False
+                data["clarification_question"] = None
+                data["sql"] = None
+                data["explanation"] = explanation or "Database schema destruction or unrestricted modification is strictly prohibited."
+                data["confidence"] = 0.0
+            else:
+                data["needs_clarification"] = True
+                data["clarification_question"] = explanation or "Could you please clarify your request?"
+                data["sql"] = None
+                data["confidence"] = 0.3
         else:
             data["sql"] = sql.strip()
             upper_sql = data["sql"].upper()
@@ -1845,6 +2439,8 @@ Self-Check:
 
             try:
                 data = json.loads(cleaned)
+                if data.get("sql"):
+                    data["sql"], data["explanation"] = sanitize_mutually_exclusive_and(data["sql"], data.get("explanation"))
                 _validate_result(data, original_question, filtered_schema, filtered_sample_values)
                 _enforce_language(data, detected_lang, model)
                 data["relevant_tables"] = relevant_tables
@@ -1874,6 +2470,8 @@ Output ONLY raw valid JSON:
                 retry_res = model.generate_content(retry_prompt, generation_config=gen_config)
                 retry_cleaned = _clean_json_string(retry_res.text or "")
                 retry_data = json.loads(retry_cleaned)
+                if retry_data.get("sql"):
+                    retry_data["sql"], retry_data["explanation"] = sanitize_mutually_exclusive_and(retry_data["sql"], retry_data.get("explanation"))
                 _validate_result(retry_data, original_question, filtered_schema, filtered_sample_values)
                 _enforce_language(retry_data, detected_lang, model)
                 retry_data["relevant_tables"] = relevant_tables
@@ -1925,113 +2523,147 @@ def generate_zero_result_explanation(
     elif "order" in q_lower or "orders" in q_lower or "orders" in sql_lower:
         entity = "order"
         entity_plural = "orders"
-    elif "appointment" in q_lower or "appointments" in q_lower or "appointments" in sql_lower:
-        entity = "appointment"
-        entity_plural = "appointments"
+    elif "transaction" in q_lower or "transactions" in q_lower or "transactions" in sql_lower:
+        entity = "transaction"
+        entity_plural = "transactions"
+    elif "item" in q_lower or "items" in q_lower:
+        entity = "item"
+        entity_plural = "items"
     else:
         entity = "record"
         entity_plural = "records"
 
-    # 2. Check if a specific name or literal search term was queried in SQL WHERE clause
-    # e.g. WHERE LOWER(name) LIKE '%virthi%' or WHERE name = 'xyzabc123'
-    name_col_pattern = r"(?:WHERE|AND|OR)\s+(?:LOWER\s*\(\s*)?([a-zA-Z0-9_]+)(?:\s*\))?\s*(?:LIKE|=)\s*['\"]%?([^%'\"]+)%?['\"]"
-    name_matches = re.findall(name_col_pattern, sql, re.IGNORECASE)
+    # 2. Extract WHERE clause from executed SQL
+    where_match = re.search(r"\bWHERE\b(.*?)(?:\bORDER\s+BY\b|\bGROUP\s+BY\b|\bLIMIT\b|;|\Z)", sql, re.IGNORECASE | re.DOTALL)
+    where_clause = where_match.group(1).strip() if where_match else ""
 
     specific_search_val = None
     is_name_search = False
+    explanation = None
 
-    for col_name, val in name_matches:
-        val_clean = val.strip()
-        col_lower = col_name.lower()
-        if col_lower in ("name", "patient_name", "doctor_name", "customer_name", "product_name"):
-            specific_search_val = val_clean
-            is_name_search = True
-            break
-        elif any(w.lower() == val_clean.lower() for w in re.findall(r"\b[a-zA-Z0-9_]+\b", question)):
-            # Literal value appears directly in user question and is not a common keyword
-            if val_clean.lower() not in ("completed", "scheduled", "cancelled", "male", "female", "active"):
-                specific_search_val = val_clean
-                if "name" in q_lower or entity in ("patient", "doctor", "customer"):
-                    is_name_search = True
+    if where_clause:
+        # Multi-value or single-value filter extraction via sqlglot
+        filter_info = extract_where_filter_values(sql)
+        for col_expr, requested_vals in filter_info:
+            col_l = col_expr.lower()
+            if "strftime" in col_l or "date(" in col_l:
+                continue
+            clean_vals = [
+                str(v).strip("'\"") for v in requested_vals
+                if str(v).strip("'\"") and str(v).strip("'\"").lower() not in COMMON_COMMAND_VERBS and str(v).strip("'\"").lower() not in QUERY_STOP_WORDS
+            ]
+            if not clean_vals:
+                continue
+            col_base = col_l.split(".")[-1].strip('"`[] ')
+            is_name_col = col_base in ("name", "patient_name", "doctor_name", "customer_name", "product_name", "first_name", "last_name", "full_name")
+            if is_name_col:
+                if len(clean_vals) > 1:
+                    names_str = " or ".join(f"'{v}'" for v in clean_vals)
+                    explanation = f"No {entity} found with the name {names_str}. Please check the spelling and try again."
+                else:
+                    explanation = f"No {entity} found with the name '{clean_vals[0]}'. Please check the spelling and try again."
+                break
+            else:
+                col_lbl = col_base.replace("_", " ").strip()
+                if len(clean_vals) > 1:
+                    vals_str = " or ".join(f"'{v}'" for v in clean_vals)
+                    explanation = f"Query executed successfully — no {entity_plural} found matching {col_lbl} {vals_str}."
+                else:
+                    explanation = f"Query executed successfully — no {entity_plural} found matching {col_lbl} '{clean_vals[0]}'."
                 break
 
-    # If not found via regex above, check if question contains a specific unquoted search token (e.g. virthi, xyzabc123)
-    if not specific_search_val:
-        stop_words = {
-            "show", "me", "list", "get", "find", "all", "the", "of", "for", "with", "in",
-            "by", "on", "at", "to", "a", "an", "is", "are", "was", "were", "who", "whose",
-            "details", "record", "records", "search", "query", "check", "info", "information",
-            "patients", "patient", "doctors", "doctor", "customers", "customer", "orders", "order",
-            "products", "product", "appointments", "appointment", "named", "name", "called"
-        }
-        tokens = [w for w in re.findall(r"\b[a-zA-Z0-9_]+\b", question) if w.lower() not in stop_words and len(w) > 2]
-        for token in tokens:
-            if token.lower() in sql_lower:
-                specific_search_val = token
-                is_name_search = True
-                break
+        # Check if a true name column was filtered via LIKE or = regex if not yet resolved
+        if not explanation:
+            name_col_pattern = r"(?:(?:LOWER\s*\(\s*)?([a-zA-Z0-9_\.]*name[a-zA-Z0-9_\.]*)(?:\s*\))?)\s*(?:LIKE|=)\s*['\"]%?([^%'\"]+)%?['\"]"
+            name_matches = re.findall(name_col_pattern, where_clause, re.IGNORECASE)
 
-    # 3. Rule-based explanation construction
-    if specific_search_val:
-        if is_name_search:
-            explanation = f"No {entity} found with the name '{specific_search_val}'. Please check the spelling and try again."
-        else:
-            explanation = f"Query executed successfully — no {entity_plural} found matching '{specific_search_val}'."
-    else:
-        # Criteria search (e.g. "patients visited last 5 days" or "patients older than 90")
+            for col_name, val in name_matches:
+                val_clean = val.strip()
+                val_l = val_clean.lower()
+                col_base = col_name.lower().split(".")[-1]
+                if col_base in ("name", "patient_name", "doctor_name", "customer_name", "product_name", "first_name", "last_name", "full_name"):
+                    if val_l not in COMMON_COMMAND_VERBS and val_l not in QUERY_STOP_WORDS:
+                        specific_search_val = val_clean
+                        is_name_search = True
+                        break
+
+            if is_name_search and specific_search_val:
+                explanation = f"No {entity} found with the name '{specific_search_val}'. Please check the spelling and try again."
+
+        # Date without year: strftime('%m', ...) BETWEEN '01' AND '02'
+        if not explanation:
+            m_range = re.search(r"strftime\s*\(\s*['\"]%m['\"]\s*,\s*[^)]+\)\s*BETWEEN\s*['\"](\d{2})['\"]\s*AND\s*['\"](\d{2})['\"]", where_clause, re.IGNORECASE)
+            if m_range:
+                m1, m2 = m_range.group(1), m_range.group(2)
+                m1_name = MONTH_NAMES.get(m1, f"month {m1}")
+                m2_name = MONTH_NAMES.get(m2, f"month {m2}")
+                explanation = f"Query executed successfully — no {entity_plural} found with appointments between {m1_name} and {m2_name} (no year given, so all years were included)."
+
+        # Date without year: strftime('%m', ...) = '03'
+        if not explanation:
+            m_single = re.search(r"strftime\s*\(\s*['\"]%m['\"]\s*,\s*[^)]+\)\s*=\s*['\"](\d{2})['\"]", where_clause, re.IGNORECASE)
+            if m_single:
+                m = m_single.group(1)
+                m_name = MONTH_NAMES.get(m, f"month {m}")
+                explanation = f"Query executed successfully — no {entity_plural} found for {m_name} (no year given, so all years were included)."
+
+        # Explicit date range: BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'
+        if not explanation:
+            d_range = re.search(r"(?:BETWEEN\s*['\"](\d{4}-\d{2}-\d{2})['\"]\s*AND\s*['\"](\d{4}-\d{2}-\d{2})['\"])", where_clause, re.IGNORECASE)
+            if d_range:
+                d1, d2 = d_range.group(1), d_range.group(2)
+                explanation = f"Query executed successfully — no {entity_plural} found between {d1} and {d2}."
+
+        # Year filter: strftime('%Y', ...) = 'YYYY' or LIKE 'YYYY%'
+        if not explanation:
+            y_match = re.search(r"strftime\s*\(\s*['\"]%Y['\"]\s*,\s*[^)]+\)\s*=\s*['\"](\d{4})['\"]", where_clause, re.IGNORECASE)
+            if not y_match:
+                y_match = re.search(r"[a-zA-Z0-9_\.]+\s*LIKE\s*['\"](\d{4})%['\"]", where_clause, re.IGNORECASE)
+            if not y_match:
+                y_match = re.search(r"[a-zA-Z0-9_\.]+\s*=\s*['\"](\d{4})['\"]", where_clause, re.IGNORECASE)
+            if y_match:
+                year_val = y_match.group(1)
+                explanation = f"Query executed successfully — no {entity_plural} found for year {year_val}."
+
+        # Relative date: date('now', '-30 days')
+        if not explanation:
+            if "date('now'" in where_clause.lower() or 'date("now"' in where_clause.lower():
+                if "-30 day" in where_clause.lower():
+                    explanation = f"Query executed successfully — no {entity_plural} found in the last 30 days."
+                else:
+                    explanation = f"Query executed successfully — no {entity_plural} found matching recent date criteria."
+
+        # Specific attribute filter in WHERE (e.g. diagnosis = 'XYZ' or status = 'ABC')
+        if not explanation:
+            lit_match = re.search(r"([a-zA-Z0-9_\.]+)\s*=\s*['\"]([^'\"]+)['\"]", where_clause)
+            if lit_match:
+                col, val = lit_match.group(1).split(".")[-1], lit_match.group(2)
+                if val.lower() not in COMMON_COMMAND_VERBS:
+                    explanation = f"Query executed successfully — no {entity_plural} found matching {col} '{val}'."
+
+    if not explanation:
+        # Generic criteria summary from question
         criteria = re.sub(
-            r"^(?:list\s+of|show\s+me|find|get|give\s+me|display|search\s+for|what\s+are\s+the|which)\s+",
+            r"^(?:list\s+of|show\s+me|find|get|give\s+me|give|display|search\s+for|what\s+are\s+the|which)\s+",
             "",
             question.strip(),
             flags=re.IGNORECASE,
         ).strip()
         if criteria.lower().startswith(entity_plural):
             remainder = criteria[len(entity_plural):].strip()
-            if remainder.startswith("who ") or remainder.startswith("that ") or remainder.startswith("with ") or remainder.startswith("visited") or remainder.startswith("in "):
+            if remainder:
                 explanation = f"Query executed successfully — no {entity_plural} found {remainder}."
-            elif remainder:
-                explanation = f"Query executed successfully — no {entity_plural} found matching '{remainder}'."
             else:
                 explanation = f"Query executed successfully — no {entity_plural} found."
         elif criteria.lower().startswith(entity):
             remainder = criteria[len(entity):].strip()
             if remainder:
-                explanation = f"Query executed successfully — no {entity} found matching '{remainder}'."
+                explanation = f"Query executed successfully — no {entity} found {remainder}."
             else:
                 explanation = f"Query executed successfully — no {entity} found."
         else:
             explanation = f"Query executed successfully — no {entity_plural} found matching '{criteria}'."
 
-    # 4. Optional Gemini enhancement if model is available and query is English/complex
-    if GEMINI_API_KEY and detected_language not in ("tamil", "thanglish"):
-        try:
-            model = genai.GenerativeModel(_WORKING_MODEL)
-            zero_prompt = f"""You are an assistant reporting SQLite database query results.
-A query executed successfully against SQLite but returned 0 rows (no matching records found).
-
-User Question: "{question}"
-Executed SQL: "{sql}"
-Original Description: "{original_explanation or ''}"
-
-Write a clear, concise, user-friendly 1-sentence explanation stating that the query executed successfully but found no matching records.
-STRICT RULES:
-1. Restate the specific condition or criteria that was checked (e.g., "Query executed successfully — no patients found matching 'visited in the last 5 days'." or "No patient found with the name 'virthi'. Please check the spelling and try again.").
-2. If the user searched for a specific name, ID, or term, you MUST use the EXACT literal term the user typed (e.g., 'virthi', 'xyzabc123'). NEVER substitute it with another name or existing database record.
-3. Keep it polite, clear, and reassuring.
-4. Output ONLY the plain explanation sentence, without quotes, backticks, or JSON.
-"""
-            resp = model.generate_content(
-                zero_prompt,
-                generation_config={"temperature": 0.0, "max_output_tokens": 80},
-                request_options={"timeout": 4.0},
-            )
-            resp_text = (resp.text or "").strip().strip('"').strip("'")
-            if resp_text and len(resp_text) > 10 and not resp_text.startswith("{"):
-                # Ensure the exact search value was not mangled by Gemini
-                if not specific_search_val or specific_search_val.lower() in resp_text.lower():
-                    explanation = resp_text
-        except Exception as g_err:
-            logger.debug("Gemini zero-result explanation call failed or timed out: %s", g_err)
 
     # 5. Language constraints
     if detected_language == "thanglish":

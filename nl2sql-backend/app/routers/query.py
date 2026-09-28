@@ -16,6 +16,8 @@ from app.services.sql_generator import (
     generate_zero_result_explanation,
     extract_entity_conjunctions,
     evaluate_multi_entity_results,
+    sanitize_mutually_exclusive_and,
+    evaluate_where_clause_results,
 )
 from app.services.sql_validator import validate_sql
 from app.services.execution_engine import run_select
@@ -149,6 +151,7 @@ class QueryResponse(BaseModel):
     data_available: Optional[bool] = True
     unavailable_message: Optional[str] = None
     corrected_terms: Optional[List[Dict[str, Any]]] = []
+    intent: Optional[str] = "database"
 
 
 class ConfirmWriteRequest(BaseModel):
@@ -178,6 +181,43 @@ def handle_query(
     """Translate natural language to SQL, validate it, execute it, and record history."""
     # 0. Enforce Rate Limiting (20 queries / min per session_id)
     check_rate_limit(payload.session_id)
+
+    # Validate input: empty string, whitespace only, punctuation only, or excessively long string
+    raw_text = payload.text if payload.text else ""
+    stripped = raw_text.strip()
+    if not stripped or all(c in "?!.,;: \t\n\r" for c in stripped):
+        return QueryResponse(
+            query_id=str(uuid.uuid4()),
+            sql=None,
+            explanation="Please enter a valid question or search query.",
+            confidence=0.0,
+            needs_clarification=True,
+            clarification_question="Please enter a question about your database (e.g., 'How many patients are there?').",
+            query_type="clarification",
+            result=[],
+            chart_type="none",
+            interpreted_text=raw_text,
+            detected_language="english",
+            data_available=True,
+            intent="database",
+        )
+
+    if len(raw_text) > 4000:
+        return QueryResponse(
+            query_id=str(uuid.uuid4()),
+            sql=None,
+            explanation="The question is too long. Please provide a more concise question (under 4000 characters).",
+            confidence=0.0,
+            needs_clarification=True,
+            clarification_question="Your question exceeds the maximum length. Please shorten your query.",
+            query_type="clarification",
+            result=[],
+            chart_type="none",
+            interpreted_text=raw_text[:200] + "...",
+            detected_language="english",
+            data_available=True,
+            intent="database",
+        )
 
     session = get_session(payload.session_id)
     if not session:
@@ -305,19 +345,23 @@ def handle_query(
     unavailable_msg = gen_data.get("unavailable_message")
     corrected_terms = gen_data.get("corrected_terms") or []
 
-    # Handle data unavailable in connected database schema
-    if not data_available:
-        msg_text = unavailable_msg or "This information is not tracked in the connected database schema."
+    # Handle conversational messages or data unavailable in connected database schema
+    is_conv = (gen_data.get("intent") == "conversation" or gen_data.get("query_type") == "conversation")
+    if not data_available or is_conv:
+        q_type = "conversation" if is_conv else "unavailable"
+        msg_text = gen_data.get("explanation") if is_conv else (unavailable_msg or "This information is not tracked in the connected database schema.")
+        confidence = gen_data.get("confidence", 1.0 if is_conv else 0.85)
+
         query_record = QueryHistoryModel(
             session_id=payload.session_id,
             conversation_id=conv.id,
             nl_query=payload.text,
-            generated_sql="-- Data unavailable in schema",
+            generated_sql="-- Conversational query" if is_conv else "-- Data unavailable in schema",
             explanation=msg_text,
             result_json="[]",
             chart_type="none",
-            confidence=0.85,
-            query_type="unavailable",
+            confidence=confidence,
+            query_type=q_type,
             self_corrected=0,
             correction_attempts=0,
             created_at=datetime.utcnow(),
@@ -330,10 +374,10 @@ def handle_query(
             query_id=str(query_record.id),
             sql=None,
             explanation=msg_text,
-            confidence=0.85,
+            confidence=confidence,
             needs_clarification=False,
             clarification_question=None,
-            query_type="unavailable",
+            query_type=q_type,
             result=[],
             chart_type="none",
             interpreted_text=interpreted_text,
@@ -341,8 +385,9 @@ def handle_query(
             self_corrected=False,
             correction_attempts=0,
             data_available=False,
-            unavailable_message=msg_text,
+            unavailable_message=None if is_conv else msg_text,
             corrected_terms=corrected_terms,
+            intent="conversation" if is_conv else "database",
         )
 
     # Handle clarification needed before validation or execution
@@ -443,6 +488,8 @@ def handle_query(
 
     current_sql = gen_data.get("sql") or ""
     current_explanation = gen_data.get("explanation", "")
+    if current_sql:
+        current_sql, current_explanation = sanitize_mutually_exclusive_and(current_sql, current_explanation)
     current_confidence = float(gen_data.get("confidence", 0.9))
     query_type = gen_data.get("query_type", "select")
     upper_sql = current_sql.strip().upper()
@@ -554,6 +601,8 @@ def handle_query(
             confidence=current_confidence,
             needs_clarification=False,
             clarification_question=None,
+            needs_confirmation=True,
+            confirmation_question=f"Are you sure you want to execute this database modification?",
             query_type="write",
             result=[],
             chart_type="none",
@@ -595,6 +644,10 @@ def handle_query(
                         error_message=error_msg,
                     )
                     new_sql = regen_data.get("sql", "")
+                    if new_sql:
+                        new_sql, current_explanation = sanitize_mutually_exclusive_and(
+                            new_sql, regen_data.get("explanation", current_explanation)
+                        )
                     logger.info(
                         "[Self-Correction] Retry %d generated corrected SQL: '%s'",
                         attempt,
@@ -607,7 +660,6 @@ def handle_query(
                         "corrected_sql": new_sql,
                     })
                     current_sql = new_sql
-                    current_explanation = regen_data.get("explanation", current_explanation)
                     current_confidence = float(regen_data.get("confidence", 0.85))
                     self_corrected = True
                     continue
@@ -640,6 +692,10 @@ def handle_query(
                         error_message=error_msg,
                     )
                     new_sql = regen_data.get("sql", "")
+                    if new_sql:
+                        new_sql, current_explanation = sanitize_mutually_exclusive_and(
+                            new_sql, regen_data.get("explanation", current_explanation)
+                        )
                     logger.info(
                         "[Self-Correction] Retry %d generated corrected SQL: '%s'",
                         attempt,
@@ -652,7 +708,6 @@ def handle_query(
                         "corrected_sql": new_sql,
                     })
                     current_sql = new_sql
-                    current_explanation = regen_data.get("explanation", current_explanation)
                     current_confidence = float(regen_data.get("confidence", 0.85))
                     self_corrected = True
                     continue
@@ -753,13 +808,31 @@ def handle_query(
                 needs_clarif = True
                 clarif_q = multi_entity_eval["clarification_question"]
 
-    elif isinstance(exec_result, list) and len(exec_result) == 0:
-        current_explanation = generate_zero_result_explanation(
-            question=payload.text,
-            sql=current_sql,
-            original_explanation=current_explanation,
-            detected_language=detected_lang,
-        )
+    elif isinstance(exec_result, list):
+        where_eval = evaluate_where_clause_results(current_sql, exec_result, payload.text)
+        if where_eval:
+            current_explanation = where_eval
+        elif len(exec_result) == 0:
+            current_explanation = generate_zero_result_explanation(
+                question=payload.text,
+                sql=current_sql,
+                original_explanation=current_explanation,
+                detected_language=detected_lang,
+            )
+
+    # Determine chart visualization type
+    chart_type = "none"
+    if exec_result:
+        try:
+            from app.services.chart_advisor import advise_chart_type
+            chart_type = advise_chart_type(exec_result, current_sql)
+        except Exception as chart_err:
+            logger.warning("Could not advise chart type: %s", chart_err)
+            chart_type = "none"
+
+        # Sanity check: if rows exist, explanation must not claim zero rows
+        if current_explanation and any(current_explanation.lower().startswith(p) for p in ("no matching", "no patient", "no doctor", "no record", "no data")):
+            current_explanation = f"Retrieved {len(exec_result)} records from the database."
 
     query_record = QueryHistoryModel(
         session_id=payload.session_id,
@@ -768,7 +841,7 @@ def handle_query(
         generated_sql=current_sql,
         explanation=current_explanation,
         result_json=json.dumps(exec_result) if exec_result else "[]",
-        chart_type="none",
+        chart_type=chart_type,
         confidence=current_confidence,
         query_type="select",
         self_corrected=1 if self_corrected else 0,
@@ -789,7 +862,7 @@ def handle_query(
         clarification_question=clarif_q,
         query_type="select",
         result=exec_result or [],
-        chart_type="none",
+        chart_type=chart_type,
         interpreted_text=interpreted_text,
         detected_language=detected_lang,
         self_corrected=self_corrected,
