@@ -14,24 +14,35 @@ export default function App() {
 
   // Check and restore persisted session from localStorage on mount
   useEffect(() => {
+    let isCancelled = false;
+
     const restoreSession = async () => {
-      let storedData = null;
       try {
         const storedStr = localStorage.getItem('nl2sql_session');
         if (!storedStr) {
-          setIsRestoringSession(false);
+          if (!isCancelled) setIsRestoringSession(false);
           return;
         }
 
-        storedData = JSON.parse(storedStr);
+        let storedData = null;
+        try {
+          storedData = JSON.parse(storedStr);
+        } catch {
+          localStorage.removeItem('nl2sql_session');
+          if (!isCancelled) setIsRestoringSession(false);
+          return;
+        }
+
         if (!storedData?.session_id) {
           localStorage.removeItem('nl2sql_session');
-          setIsRestoringSession(false);
+          if (!isCancelled) setIsRestoringSession(false);
           return;
         }
 
         // Verify with backend that session is active or restorable
         const status = await getSessionStatus(storedData.session_id);
+        if (isCancelled) return;
+
         if (status?.valid === true || status?.status === 'connected') {
           const mergedSession = {
             ...storedData,
@@ -41,56 +52,32 @@ export default function App() {
           setSession(mergedSession);
           setScreen('chat');
           setSessionExpiredNotice('');
-        } else if (storedData.db_type === 'demo' && storedData.demo_name) {
-          // Seamlessly re-connect demo session if expired
-          const reconnected = await connectDB({
-            db_type: 'demo',
-            demo_name: storedData.demo_name,
-          });
-          const mergedSession = {
-            ...storedData,
-            ...reconnected,
-            status: 'connected',
-          };
-          localStorage.setItem('nl2sql_session', JSON.stringify(mergedSession));
-          setSession(mergedSession);
-          setScreen('chat');
-          setSessionExpiredNotice('');
         } else {
-          throw new Error('Your previous session expired, please reconnect.');
+          // Clear expired session and direct user to connect screen with notice
+          localStorage.removeItem('nl2sql_session');
+          setSession(null);
+          setScreen('connect');
+          setSessionExpiredNotice('Your previous session expired. Please reconnect.');
         }
-      } catch (err) {
-        if (storedData?.db_type === 'demo' && storedData?.demo_name) {
-          try {
-            const reconnected = await connectDB({
-              db_type: 'demo',
-              demo_name: storedData.demo_name,
-            });
-            const mergedSession = {
-              ...storedData,
-              ...reconnected,
-              status: 'connected',
-            };
-            localStorage.setItem('nl2sql_session', JSON.stringify(mergedSession));
-            setSession(mergedSession);
-            setScreen('chat');
-            setSessionExpiredNotice('');
-            return;
-          } catch (reconnectErr) {
-            console.warn('Demo session auto-reconnect fallback failed:', reconnectErr.message);
-          }
+      } catch {
+        if (!isCancelled) {
+          localStorage.removeItem('nl2sql_session');
+          setSession(null);
+          setScreen('connect');
+          setSessionExpiredNotice('Your previous session expired. Please reconnect.');
         }
-        console.warn('Session restoration failed:', err.message);
-        localStorage.removeItem('nl2sql_session');
-        setSession(null);
-        setScreen('connect');
-        setSessionExpiredNotice('Your previous session expired, please reconnect.');
       } finally {
-        setIsRestoringSession(false);
+        if (!isCancelled) {
+          setIsRestoringSession(false);
+        }
       }
     };
 
     restoreSession();
+
+    return () => {
+      isCancelled = true;
+    };
   }, []);
 
   const handleConnected = (sessionData) => {

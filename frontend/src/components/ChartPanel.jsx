@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, memo } from 'react';
 import { motion } from 'framer-motion';
 import {
   BarChart,
@@ -13,7 +13,7 @@ import {
   ResponsiveContainer,
 } from 'recharts';
 
-export default function ChartPanel({ result, chart_type = 'none' }) {
+function ChartPanel({ result, chart_type = 'none' }) {
   const [activeTab, setActiveTab] = useState(chart_type === 'none' ? 'table' : 'chart');
 
   // Handle null / empty result
@@ -151,3 +151,5 @@ export default function ChartPanel({ result, chart_type = 'none' }) {
     </motion.div>
   );
 }
+
+export default memo(ChartPanel);
