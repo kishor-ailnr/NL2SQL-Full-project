@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo, startTransition } from 'react';
+import { useState, useRef, useEffect, startTransition } from 'react';
 import { motion } from 'framer-motion';
 import MessageBubble from './MessageBubble';
 import VoiceButton from './VoiceButton';
@@ -54,9 +54,11 @@ export default function ChatWindow({ session, onDisconnect, onSessionUpdate }) {
             setSchemaData(data.schema);
           }
         })
-        .catch(() => {});
+        .catch((err) => {
+          console.warn('Could not prefetch database schema:', err.message);
+        });
     }
-  }, [sessionId, session?.schema, session?.schema_info]);
+  }, [sessionId, session]);
 
   // Handle clicking on an individual table pill to toggle its headers/columns
   const handleToggleTable = async (tableName) => {
@@ -76,27 +78,26 @@ export default function ChatWindow({ session, onDisconnect, onSessionUpdate }) {
         if (data?.schema) {
           setSchemaData(data.schema);
         }
-      } catch {
+      } catch (err) {
+        console.warn('Failed to fetch schema for table:', tableName, err.message);
       } finally {
         setSchemaLoading(false);
       }
     }
   };
 
-  // Active columns for currently selected table (memoized to prevent redundant array mappings)
-  const activeTableColumns = useMemo(() => {
-    return (schemaData?.[selectedTable] || []).map((col) => {
-      if (typeof col === 'string') {
-        return { name: col, type: 'TEXT', primary_key: false };
-      }
-      return {
-        name: col.name || col.column_name || String(col),
-        type: col.type || 'TEXT',
-        primary_key: Boolean(col.primary_key),
-        nullable: col.nullable !== false,
-      };
-    });
-  }, [schemaData, selectedTable]);
+  // Active columns for currently selected table
+  const activeTableColumns = (schemaData?.[selectedTable] || []).map((col) => {
+    if (typeof col === 'string') {
+      return { name: col, type: 'TEXT', primary_key: false };
+    }
+    return {
+      name: col.name || col.column_name || String(col),
+      type: col.type || 'TEXT',
+      primary_key: Boolean(col.primary_key),
+      nullable: col.nullable !== false,
+    };
+  });
 
   // Multi-conversation state
   const [conversations, setConversations] = useState([]);
@@ -116,28 +117,23 @@ export default function ChatWindow({ session, onDisconnect, onSessionUpdate }) {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [pendingWriteQuery, setPendingWriteQuery] = useState(null);
 
-  const messagesContainerRef = useRef(null);
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
   const isSendingRef = useRef(false);
 
-  // Smooth scroll to bottom without forced synchronous layout thrashing
-  const scrollToBottom = (behavior = 'smooth') => {
+  const scrollToBottom = () => {
     requestAnimationFrame(() => {
-      const container = messagesContainerRef.current;
-      if (container) {
-        container.scrollTo({ top: container.scrollHeight, behavior });
-      }
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     });
   };
 
   useEffect(() => {
-    scrollToBottom('smooth');
+    scrollToBottom();
   }, [messages, isPending]);
 
-  // Zero-thrashing input resize handler
-  const handleTextareaInput = (e) => {
-    const el = e.target;
+  // Auto-resize textarea to fit multiline content up to max-height without synchronous layout thrashing
+  useEffect(() => {
+    const el = textareaRef.current;
     if (!el) return;
     if (typeof CSS !== 'undefined' && CSS.supports && CSS.supports('field-sizing', 'content')) {
       return;
@@ -148,7 +144,7 @@ export default function ChatWindow({ session, onDisconnect, onSessionUpdate }) {
       const targetHeight = Math.min(el.scrollHeight, 140);
       el.style.height = `${Math.max(38, targetHeight)}px`;
     });
-  };
+  }, [inputValue]);
 
   // Load conversations on session mount
   const fetchConversations = async (autoSelect = false) => {
@@ -854,7 +850,7 @@ export default function ChatWindow({ session, onDisconnect, onSessionUpdate }) {
       </div>
 
       {/* Scrollable Message List (Full Height, Independent Scrolling) */}
-      <div ref={messagesContainerRef} className="flex-1 min-h-0 overflow-y-auto w-full">
+      <div className="flex-1 min-h-0 overflow-y-auto w-full">
         <div className="w-full max-w-4xl lg:max-w-5xl mx-auto px-3 sm:px-6 md:px-8 py-4 sm:py-6 space-y-4">
           {messages.map((msg) => {
             if (msg.role === 'user') {
@@ -974,11 +970,10 @@ export default function ChatWindow({ session, onDisconnect, onSessionUpdate }) {
                 rows={1}
                 value={inputValue}
                 onChange={(e) => setInputValue(e.target.value)}
-                onInput={handleTextareaInput}
                 onKeyDown={handleKeyDown}
                 placeholder="Ask a question about your database in natural language..."
                 disabled={isPending}
-                className="flex-1 max-h-32 min-h-[38px] px-3 sm:px-4 py-2 text-sm text-slate-800 placeholder-slate-400 bg-transparent resize-none focus:outline-none disabled:opacity-60 leading-normal font-sans auto-expand-textarea"
+                className="flex-1 max-h-32 min-h-[38px] px-3 sm:px-4 py-2 text-sm text-slate-800 placeholder-slate-400 bg-transparent resize-none focus:outline-none disabled:opacity-60 leading-normal font-sans"
               />
 
               {/* Voice Button */}

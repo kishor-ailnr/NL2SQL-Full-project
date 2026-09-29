@@ -868,7 +868,7 @@ def handle_query(
     if exec_result:
         try:
             from app.services.chart_advisor import advise_chart_type
-            chart_type = advise_chart_type(exec_result, current_sql)
+            chart_type = advise_chart_type(exec_result, current_sql, user_query=payload.text)
         except Exception as chart_err:
             logger.warning("Could not advise chart type: %s", chart_err)
             chart_type = "none"
@@ -1021,7 +1021,7 @@ def confirm_write(
     if result_rows:
         try:
             from app.services.chart_advisor import advise_chart_type
-            chart_type = advise_chart_type(result_rows, pending["sql"])
+            chart_type = advise_chart_type(result_rows, pending["sql"], user_query=pending.get("user_question"))
         except Exception as chart_err:
             logger.warning("Chart advisor error on confirm_write: %s", chart_err)
             chart_type = "table"

@@ -9,17 +9,32 @@ import re
 from typing import Any, Dict, List, Optional
 
 
-def advise_chart_type(result_rows: List[Dict[str, Any]], sql: Optional[str] = None) -> str:
+CHART_INTENT_PATTERN = re.compile(
+    r"\b(?:chart|charts|chartu|chartil|chartla|graph|graphs|graphla|plot|plots|plotu|"
+    r"visualize|visualise|visualization|visualisation|trend|diagram|histogram|"
+    r"pie\s*chart|bar\s*chart|line\s*chart|varaipadam)\b",
+    re.IGNORECASE,
+)
+
+
+def advise_chart_type(
+    result_rows: List[Dict[str, Any]],
+    sql: Optional[str] = None,
+    user_query: Optional[str] = None,
+) -> str:
     """Analyze query rows and SQL statement to suggest an appropriate chart type.
 
-    Returns:
-        'bar'  - Categorical comparisons, distributions with multiple categories
-        'pie'  - Small categorical proportions (e.g., gender, status with <= 5 categories)
-        'line' - Temporal series, trends over dates/months/years
-        'none' - Scalar answers, single entity details, or general tables
+    Rule: Charts are ONLY suggested when the user explicitly asks for a chart/graph/plot
+    in their natural language request (or if user_query is omitted in legacy tests).
+    Otherwise, returns 'none' so clean tabular data is displayed.
     """
     if not result_rows or not isinstance(result_rows, list) or len(result_rows) == 0:
         return "none"
+
+    # If user_query is provided, only return a chart type if chart was explicitly requested
+    if user_query is not None:
+        if not CHART_INTENT_PATTERN.search(user_query):
+            return "none"
 
     first_row = result_rows[0]
     if not isinstance(first_row, dict):

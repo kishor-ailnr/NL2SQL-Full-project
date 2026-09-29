@@ -53,11 +53,20 @@ QUERY_STOP_WORDS = {
     "by", "on", "at", "to", "a", "an", "is", "are", "was", "were", "who", "whose",
     "details", "record", "records", "search", "query", "check", "info", "information",
     "patient", "patients", "doctor", "doctors", "customer", "customers", "order", "orders",
-    "product", "products", "appointment", "appointments", "please", "can", "you",
+    "product", "products", "appointment", "appointments", "department", "departments",
+    "category", "categories", "review", "reviews", "table", "tables", "database", "databases",
+    "db", "schema", "schemas", "row", "rows", "column", "columns", "dataset", "datasets",
+    "view", "views", "data", "value", "values", "entity", "entities", "please", "can", "you",
     "give", "tell", "view", "see", "display", "named", "called", "name", "names", "about",
     "age", "ages", "gender", "genders", "id", "ids", "status", "statuses", "diagnosis",
     "from", "between", "and", "or", "not", "date", "dates", "month", "year",
-    "which", "what", "where", "how", "many", "much", "having", "than", "more", "less"
+    "which", "what", "where", "how", "many", "much", "having", "than", "more", "less",
+    # Tamil / Tanglish verbs, pronouns, and structural keywords
+    "enaku", "enakku", "kodu", "koduu", "kudu", "kudunga", "tharu", "tharuga", "kaatu",
+    "kaattu", "kaatunga", "sollu", "solu", "sollunga", "paaru", "paarunga", "irukku",
+    "irukka", "vendum", "venum", "pathina", "patriya", "patri", "oda", "la", "ku",
+    "irunthu", "ella", "ellam", "ellame", "ethana", "evvalavu", "yaar", "enna", "enga",
+    "eppadi", "eppo", "nalla", "mattum", "tha", "thanga", "thaanga", "pannu", "pannunga",
 }
 
 MONTH_NAMES = {
@@ -1225,11 +1234,20 @@ def find_near_miss_value(
     # Clean question to isolate candidate search phrase
     stop_words = QUERY_STOP_WORDS
 
-    prefix_pattern = r"^(?:show|list|get|find|search\s+for|view|display|details\s+of)\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?(?:patients?|doctors?|customers?|products?|records?|details?|info)?\s*(?:of\s+)?(?:patients?|doctors?|customers?|products?|records?|details?|info)?\s*(?:named|called|for|with)?\s*"
+    prefix_pattern = r"^(?:show|list|get|find|search\s+for|view|display|details\s+of|enaku|enakku|kodu|kudu|tharu|kaatu|kaattu)\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?(?:patients?|doctors?|customers?|products?|orders?|records?|details?|info)?\s*(?:of\s+)?(?:patients?|doctors?|customers?|products?|orders?|records?|details?|info)?\s*(?:named|called|for|with)?\s*"
     candidate_phrase = re.sub(prefix_pattern, "", nl_question.strip(), flags=re.IGNORECASE).strip()
     schema_cols = set()
+    schema_tables = set()
     if schema:
         for tbl, cols in schema.items():
+            t_low = tbl.lower()
+            schema_tables.add(t_low)
+            schema_tables.add(t_low.rstrip("s"))
+            if t_low.endswith("ies"):
+                schema_tables.add(t_low[:-3] + "y")
+            schema_tables.add(t_low + "s")
+            schema_tables.add(t_low + "es")
+
             if isinstance(cols, list):
                 for c in cols:
                     c_name = c.get("name", "") if isinstance(c, dict) else str(c)
@@ -1238,8 +1256,16 @@ def find_near_miss_value(
 
     candidate_tokens = [
         w for w in re.findall(r"\b[a-zA-Z0-9_]+\b", nl_question)
-        if w.lower() not in stop_words and w.lower() not in schema_cols and len(w) >= 3
+        if w.lower() not in stop_words
+        and w.lower() not in schema_cols
+        and w.lower() not in schema_tables
+        and len(w) >= 3
     ]
+
+    # If candidate phrase is composed entirely of stop words or schema tables/columns, ignore it
+    candidate_phrase_words = [w.lower() for w in re.findall(r"\b[a-zA-Z0-9_]+\b", candidate_phrase)]
+    if not candidate_phrase_words or all(w in stop_words or w in schema_cols or w in schema_tables for w in candidate_phrase_words):
+        candidate_phrase = ""
 
     # Check for exact matches first: if exact match exists anywhere in question or candidate phrase, no confirmation needed
     q_norm = " " + re.sub(r"[^\w\s]", " ", nl_question.lower()) + " "
@@ -1267,16 +1293,22 @@ def find_near_miss_value(
 
     # Determine priority search terms to test
     search_terms = []
-    if candidate_phrase and len(candidate_phrase) >= 3 and candidate_phrase.lower() not in stop_words:
+    if candidate_phrase and len(candidate_phrase) >= 3 and candidate_phrase.lower() not in stop_words and candidate_phrase.lower() not in schema_tables:
         search_terms.append(candidate_phrase)
     for t in candidate_tokens:
-        if t not in search_terms:
+        if t not in search_terms and t.lower() not in schema_tables and t.lower() not in stop_words:
             search_terms.append(t)
 
     for term in search_terms:
         term_lower = term.lower()
+        if term_lower in stop_words or term_lower in schema_cols or term_lower in schema_tables:
+            continue
+        if len(term_lower) < 3:
+            continue
+
         best_match = None
         best_score = 0.0
+        min_threshold = 0.85 if len(term_lower) <= 5 else 0.80
 
         for s_val, is_name in unique_samples:
             s_lower = s_val.lower()
@@ -1284,32 +1316,35 @@ def find_near_miss_value(
 
             # 1. Exact single-word match in a multi-word sample (only for person names, e.g. 'harini' -> 'Harini Krishnan')
             if term_lower in s_words:
-                if is_name and len(s_words) > 1:
+                if is_name and len(s_words) > 1 and len(term_lower) >= 4:
                     return (term, s_val)
                 # Exact word match for attributes (e.g. 'diabetes') is a valid query, not a typo
                 continue
 
             # 2. Substring match for person names (e.g. 'harini' in 'Harini Krishnan')
-            if is_name and len(term_lower) >= 4 and term_lower in s_lower:
+            if is_name and len(term_lower) >= 5 and term_lower in s_lower:
                 return (term, s_val)
 
-            # 3. Fuzzy similarity against individual words in the sample value (0.75 <= sim < 1.0)
+            # 3. Fuzzy similarity against individual words in the sample value
             for w in s_words:
                 if term_lower == w:
                     continue
+                # Length guard: skip comparison if lengths differ significantly
+                if abs(len(term_lower) - len(w)) > 2:
+                    continue
                 sim = difflib.SequenceMatcher(None, term_lower, w).ratio()
-                if 0.75 <= sim < 1.0 and sim > best_score:
+                if sim >= min_threshold and sim < 1.0 and sim > best_score:
                     best_score = sim
                     best_match = s_val
 
-            # 4. Fuzzy similarity against full sample value (0.75 <= sim < 1.0)
-            if term_lower != s_lower:
+            # 4. Fuzzy similarity against full sample value
+            if term_lower != s_lower and abs(len(term_lower) - len(s_lower)) <= 3:
                 full_sim = difflib.SequenceMatcher(None, term_lower, s_lower).ratio()
-                if 0.75 <= full_sim < 1.0 and full_sim > best_score:
+                if full_sim >= min_threshold and full_sim < 1.0 and full_sim > best_score:
                     best_score = full_sim
                     best_match = s_val
 
-        if best_match and best_score >= 0.75:
+        if best_match and best_score >= min_threshold:
             return (term, best_match)
 
     return None
@@ -1597,8 +1632,52 @@ def generate_sql(
                 }
                 _put_in_cache(cache_key, data)
                 return data
+    # Direct table request fast path (e.g. "enaku customer table kodu", "customers table", "show patient table")
+    if schema:
+        words = [w.lower() for w in re.findall(r"\b[a-zA-Z0-9_]+\b", nl_question)]
+        meaningful_words = [w for w in words if w not in QUERY_STOP_WORDS]
+        filter_indicators = {
+            "where", "filter", "when", "with", "having", "count", "avg", "average",
+            "sum", "total", "min", "max", "top", "limit", "older", "younger",
+            "greater", "less", "more", "price", "cost", "status", "active",
+            "admitted", "discharged", "appointment", "prescribe", "visit", "billing",
+            "than", "between", "like", "contains"
+        }
+        if meaningful_words and not set(words).intersection(filter_indicators):
+            matched_table = None
+            for tbl in schema.keys():
+                t_clean = tbl.lower()
+                tbl_variations = {t_clean, t_clean.rstrip("s"), t_clean + "s", t_clean + "es"}
+                if t_clean.endswith("ies"):
+                    tbl_variations.add(t_clean[:-3] + "y")
+                if any(w in tbl_variations for w in meaningful_words):
+                    remaining = [w for w in meaningful_words if w not in tbl_variations]
+                    if not remaining:
+                        matched_table = tbl
+                        break
+            if matched_table:
+                logger.info("Direct whole-table query resolved for table '%s' from question '%s'", matched_table, nl_question)
+                sql = f"SELECT * FROM {matched_table};"
+                exp = f"Retrieves all records from the {matched_table} table."
+                data = {
+                    "data_available": True,
+                    "unavailable_message": None,
+                    "corrected_terms": [],
+                    "needs_clarification": False,
+                    "clarification_question": None,
+                    "interpreted_text": nl_question,
+                    "query_type": "select",
+                    "sql": sql,
+                    "result": [],
+                    "explanation": exp,
+                    "confidence": 0.98,
+                    "detected_language": detect_input_language(nl_question),
+                    "relevant_tables": [matched_table],
+                }
+                _put_in_cache(cache_key, data)
+                return data
 
-    # Schema-aware retrieval (RAG): retrieve top 3-4 most relevant tables (or all if <= 4)
+
     from app.services.rag_service import retrieve_relevant_tables
     relevant_tables = retrieve_relevant_tables(session_id, nl_question, top_k=4)
 

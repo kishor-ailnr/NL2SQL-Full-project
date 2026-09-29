@@ -88,10 +88,7 @@ html, body {
 }
 
 /* Native zero-reflow dynamic textarea expansion in modern Chromium */
-textarea, .auto-expand-textarea {
+textarea {
   field-sizing: content;
-  max-height: 140px;
-  min-height: 38px;
-  resize: none;
 }
 
